@@ -1,7 +1,8 @@
-import { ArrowDownUp, Check, ChevronLeft, ChevronRight, Database, Github, Search, Star, X } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
-import { dispatch, errorMessage, formatTime, type Filters, type Repo, type RepoPage, type StarStatus, type SyncStatus } from './api'
+import { ChevronLeft, ChevronRight, Database, Github, Search, Star, X } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { dispatch, errorMessage, type Filters, type Repo, type RepoPage, type StarStatus } from './api'
 import { RepoDetails, type RepoSelection } from './RepoDetails'
+import { SyncPanel, useLibrarySync } from './SyncPanel'
 import { Loading, Notice, RepoState } from './ui'
 
 const defaultFilters: Filters = { query: '', language: null, tag: null, status: 'starred' }
@@ -28,16 +29,10 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
   const [loading, setLoading] = useState(true)
   const [listError, setListError] = useState('')
   const [revision, setRevision] = useState(0)
-  const [sync, setSync] = useState<SyncStatus | null>(null)
-  const [syncError, setSyncError] = useState<{ message: string; lastSuccess: string | null } | null>(null)
-  const [statusError, setStatusError] = useState('')
-  const [starting, setStarting] = useState(false)
-  const syncGeneration = useRef(0)
-  const lastSuccess = sync?.last_success_at ?? null
-  const running = starting || sync?.running
+  const refreshLibrary = useCallback(() => setRevision((current) => current + 1), [])
+  const sync = useLibrarySync(refreshLibrary)
+  const lastSuccess = sync.status?.last_success_at ?? null
   const filtered = !!(query.trim() || filters.language || filters.tag)
-  const invocationError = syncError?.lastSuccess === lastSuccess ? syncError.message : ''
-  const syncFailure = invocationError || (!running && sync?.last_result?.state === 'error' ? sync.last_result.message : '') || statusError
   const scope = starScopes.find((item) => item.value === filters.status)!
 
   useEffect(() => {
@@ -72,52 +67,13 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
   }, [filters, offset, revision, lastSuccess])
 
   useEffect(() => {
-    let active = true
-    let timer: number
-    async function poll() {
-      const generation = syncGeneration.current
-      try {
-        const result = await dispatch('sync_status', {})
-        if (active && generation === syncGeneration.current) {
-          setSync(result)
-          setStatusError('')
-        }
-      } catch (error) {
-        if (active && generation === syncGeneration.current) setStatusError(errorMessage(error))
-      } finally {
-        if (active) timer = window.setTimeout(() => void poll(), 2500)
-      }
-    }
-    void poll()
-    return () => { active = false; window.clearTimeout(timer) }
-  }, [])
-
-  useEffect(() => {
     onSync(lastSuccess)
   }, [lastSuccess, onSync])
 
   useEffect(() => {
-    function refresh() { setRevision((current) => current + 1) }
-    window.addEventListener('focus', refresh)
-    return () => window.removeEventListener('focus', refresh)
-  }, [])
-
-  async function startSync() {
-    if (running) return
-    ++syncGeneration.current
-    setStarting(true)
-    setSyncError(null)
-    try {
-      const result = await dispatch('sync_start', {})
-      setSync(result)
-      setStatusError('')
-    } catch (error) {
-      setSyncError({ message: errorMessage(error), lastSuccess })
-    } finally {
-      ++syncGeneration.current
-      setStarting(false)
-    }
-  }
+    window.addEventListener('focus', refreshLibrary)
+    return () => window.removeEventListener('focus', refreshLibrary)
+  }, [refreshLibrary])
 
   function changeFilters(next: Partial<Filters>) {
     setOffset(0)
@@ -132,7 +88,8 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
 
   return (
     <>
-      <aside className="sidebar" aria-label="资料库筛选">
+      <aside className="sidebar" aria-label="资料库控制">
+        <SyncPanel sync={sync} onOpenSettings={onOpenSettings} />
         <div className="sidebar-controls">
           <div>
             <h2 className="rail-label">资料库</h2>
@@ -154,26 +111,6 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
             <FilterSelect label="标签" value={filters.tag} options={page?.tags ?? []} disabled={!page} onChange={(tag) => changeFilters({ tag })} />
           </div>
         </div>
-        <section className="sync" aria-label="GitHub 同步">
-          <div className="section-heading">
-            <h2 className="rail-label"><Github size={15} /> GitHub 同步</h2>
-            {sync?.last_result?.state === 'success' && !running && <Check size={16} className="sync-check" aria-label="最近一次同步成功" />}
-          </div>
-          <div className="sync-status" aria-live="polite">
-            <span>{lastSuccess ? `上次成功 ${formatTime(lastSuccess)}` : sync ? '尚未成功同步' : '等待同步状态'}</span>
-            {running && <span>正在同步星标…</span>}
-            {!running && sync?.last_result?.state === 'success' && <span>已同步 {sync.last_result.starred_count.toLocaleString('zh-CN')} 个星标</span>}
-          </div>
-          {syncFailure && (
-            <div className="settings-callout">
-              <Notice>{syncFailure}</Notice>
-              <button type="button" className="text-button" aria-haspopup="dialog" onClick={onOpenSettings}>打开 GitHub 设置</button>
-            </div>
-          )}
-          <button type="button" className="button sync-button" disabled={!!running} onClick={() => void startSync()}>
-            <ArrowDownUp size={15} /> {running ? '同步中…' : '同步星标'}
-          </button>
-        </section>
       </aside>
       <main className="main-pane" id="library">
         {selection ? (
@@ -186,7 +123,7 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
             contextLocked={contextLocked}
             onBack={() => onSelect(null)}
             onContext={onContext}
-            onSaved={() => setRevision((current) => current + 1)}
+            onSaved={refreshLibrary}
           />
         ) : (
           <div className="repo-list">
@@ -202,7 +139,7 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
               </div>
             </header>
             {loading && <Loading label="正在读取资料库…" />}
-            {listError && <Notice retry={() => setRevision((current) => current + 1)}>{listError}</Notice>}
+            {listError && <Notice retry={refreshLibrary}>{listError}</Notice>}
             {page && !loading && !listError && (
               page.repos.length ? (
                 <>

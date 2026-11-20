@@ -39,6 +39,7 @@ export interface SyncStatus {
   running: boolean
   last_success_at: string | null
   last_result: { state: 'success'; starred_count: number } | { state: 'error'; message: string } | null
+  progress?: { phase: 'preparing' | 'fetching' | 'saving'; pages: number; repositories: number } | null
 }
 
 export interface SettingsStatus {
