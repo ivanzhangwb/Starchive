@@ -45,9 +45,9 @@ async fn lists_and_edits_the_shared_library_with_lossless_ids() -> Result<()> {
     let updated = app
         .dispatch(
             "repo_update",
-            json!({"repo_id": id, "note": "中文索引", "tags": ["desktop"]}),
+            json!({"repo_id": id, "note": {"expected": "", "value": "中文索引"}, "tags": {"expected": [], "value": ["desktop"]}}),
         )
-        .await?;
+        .await?["repo"].clone();
     assert_eq!(updated["id"], id);
     assert_eq!(
         store.get_repository(large_id).await?.unwrap().note,
@@ -79,6 +79,158 @@ async fn lists_and_edits_the_shared_library_with_lossless_ids() -> Result<()> {
         )
         .await
         .is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn desktop_patches_only_dirty_fields_and_rejects_stale_fields_atomically() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("library.sqlite3");
+    let cli_store = Store::open(&path).await?;
+    cli_store
+        .try_sync_lease()
+        .await?
+        .unwrap()
+        .complete_snapshot(&[repo(1, "fixture/edit", false)])
+        .await?;
+    let desktop = Desktop::open(&path, dir.path().join("missing pi")).await?;
+
+    cli_store
+        .edit_repository(1, Some("new CLI note"), None)
+        .await?;
+    let saved = desktop
+        .dispatch(
+            "repo_update",
+            json!({
+                "repo_id": "1", "tags": {"expected": [], "value": [" Desk ", "desk"]}
+            }),
+        )
+        .await?;
+    assert_eq!(saved["status"], "saved");
+    assert_eq!(saved["repo"]["note"], "new CLI note");
+    assert_eq!(saved["repo"]["tags"], json!(["Desk"]));
+
+    let conflict = desktop
+        .dispatch(
+            "repo_update",
+            json!({
+                "repo_id": "1", "note": {"expected": "", "value": "my draft"},
+                "tags": {"expected": ["Desk"], "value": []}
+            }),
+        )
+        .await?;
+    assert_eq!(conflict["status"], "conflict");
+    assert_eq!(conflict["repo"]["note"], "new CLI note");
+    assert_eq!(cli_store.get_repository(1).await?.unwrap().tags, ["Desk"]);
+
+    let cleared = desktop
+        .dispatch(
+            "repo_update",
+            json!({
+                "repo_id": "1", "note": {"expected": "new CLI note", "value": ""},
+                "tags": {"expected": ["Desk"], "value": []}
+            }),
+        )
+        .await?;
+    assert_eq!(cleared["status"], "saved");
+    assert_eq!(cleared["repo"]["note"], "");
+    assert_eq!(cleared["repo"]["tags"], json!([]));
+
+    let other = Desktop::open(&path, dir.path().join("missing pi")).await?;
+    let (first, second) = tokio::join!(
+        desktop.dispatch(
+            "repo_update",
+            json!({"repo_id": "1", "note": {"expected": "", "value": "first"}})
+        ),
+        other.dispatch(
+            "repo_update",
+            json!({"repo_id": "1", "note": {"expected": "", "value": "second"}})
+        )
+    );
+    let (first, second) = (first?, second?);
+    let persisted = cli_store.get_repository(1).await?.unwrap();
+    let (saved, conflicted, value) = if first["status"] == "saved" {
+        (first, second, "first")
+    } else {
+        (second, first, "second")
+    };
+    assert_eq!(saved["status"], "saved");
+    assert_eq!(conflicted["status"], "conflict");
+    assert_eq!(conflicted["repo"]["note"], value);
+    assert_eq!(persisted.note, value);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reopens_session_candidates_with_offline_readmes_only_in_their_own_session() -> Result<()> {
+    use starchive_core::agent::{Agent, AgentRequest, AgentResponse, PublicSearch, Repository};
+
+    struct Fixture;
+    impl Agent for Fixture {
+        async fn respond(&self, _: &AgentRequest) -> Result<AgentResponse> {
+            Ok(AgentResponse {
+                text: "Search options".into(),
+                recommendations: vec![],
+                gaps: vec![],
+            })
+        }
+    }
+    impl PublicSearch for Fixture {
+        async fn search_public(&self, _: &str) -> Result<Vec<Repository>> {
+            Ok(vec![Repository {
+                id: 9,
+                full_name: "fixture/external".into(),
+                description: None,
+                language: None,
+                html_url: "https://github.com/fixture/external".into(),
+                topics: vec![],
+                private: false,
+                starred: false,
+                note: None,
+            }])
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("library.sqlite3");
+    let store = Store::open(&path).await?;
+    let conversations = starchive_core::agent::Conversations::new(&store);
+    let session = conversations.create("Saved search").await?;
+    let library = starchive_core::runtime::AgentLibrary::load(&store).await?;
+    conversations
+        .ask(session.id, "Find options", &library, &Fixture)
+        .await?;
+    conversations
+        .expand(session.id, "offline search", &Fixture)
+        .await?;
+    conversations
+        .cache_candidate_readme(session.id, 9, "README saved offline")
+        .await?;
+    store.pool().close().await;
+
+    let app = Desktop::open(&path, dir.path().join("missing pi")).await?;
+    let id = session.id.to_string();
+    let session = app
+        .dispatch("session_get", json!({"session_id": id}))
+        .await?;
+    assert_eq!(session["messages"][2]["candidates"][0]["repo"]["id"], "9");
+    let detail = app
+        .dispatch("repo_get", json!({"repo_id": "9", "session_id": id}))
+        .await?;
+    assert_eq!(detail["repo"]["full_name"], "fixture/external");
+    assert_eq!(detail["readme"], "README saved offline");
+    assert_eq!(detail["editable"], false);
+    assert!(app
+        .dispatch("repo_get", json!({"repo_id": "9"}))
+        .await?
+        .is_null());
+    let another = app.dispatch("session_create", json!({})).await?;
+    assert!(app
+        .dispatch(
+            "repo_get",
+            json!({"repo_id": "9", "session_id": another["id"]})
+        )
+        .await?
+        .is_null());
     Ok(())
 }
 

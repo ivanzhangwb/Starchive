@@ -19,6 +19,6 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tokio = { version = "1", features = ["full"] }
 starchive-core = { path = "core" }
 
-[profile.release]
-# Avoid malformed load commands in stripped proc-macro libraries on newer macOS toolchains.
-strip = "none"
+[profile.release.package.sqlx-macros]
+# Preserve the proc macro's Mach-O string-table alignment on newer macOS toolchains.
+strip = false

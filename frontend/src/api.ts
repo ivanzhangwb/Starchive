@@ -15,10 +15,9 @@ export interface LibraryRepo extends Repo {
   tags: string[]
 }
 
-export interface RepoDetail {
-  repo: LibraryRepo
-  readme: string | null
-}
+export type RepoDetail = { readme: string | null } & (
+  { editable: true; repo: LibraryRepo } | { editable: false; repo: Repo }
+)
 
 export type StarStatus = 'starred' | 'unstarred' | 'all'
 
@@ -85,11 +84,12 @@ export interface Session extends SessionSummary {
 type SessionId = { session_id: string }
 type RepoId = { repo_id: string }
 type Empty = Record<string, never>
+type FieldEdit<T> = { expected: T; value: T }
 
 type Dispatch = {
   repo_list: [Filters & { offset: number; limit: number }, RepoPage]
-  repo_get: [RepoId, RepoDetail | null]
-  repo_update: [RepoId & Pick<LibraryRepo, 'note' | 'tags'>, LibraryRepo]
+  repo_get: [RepoId & { session_id: string | null }, RepoDetail | null]
+  repo_update: [RepoId & { note?: FieldEdit<string>; tags?: FieldEdit<string[]> }, { status: 'saved' | 'conflict'; repo: LibraryRepo }]
   repo_readme: [RepoId & { session_id: string | null }, { readme: string | null }]
   sync_status: [Empty, SyncStatus]
   sync_start: [Empty, SyncStatus]

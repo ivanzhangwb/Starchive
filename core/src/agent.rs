@@ -5,11 +5,14 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use crate::Store;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+mod request;
+use request::{AgentHistory, InputScope};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
@@ -43,6 +46,8 @@ pub struct Turn {
     pub message: String,
     pub response: AgentResponse,
     pub candidates: Vec<Repository>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_scope: Option<InputScope>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +68,17 @@ pub struct Repository {
     pub private: bool,
     pub starred: bool,
     pub note: Option<String>,
+}
+
+pub enum RepositoryDetails {
+    Library {
+        repo: crate::Repository,
+        readme: Option<String>,
+    },
+    Candidate {
+        repo: Repository,
+        readme: Option<String>,
+    },
 }
 
 pub trait Library: Sync {
@@ -130,6 +146,7 @@ impl Agent for PiAgent {
                 "--system-prompt",
                 PI_SYSTEM_PROMPT,
             ])
+            .env_remove(crate::github::TOKEN_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -185,8 +202,7 @@ impl Agent for PiAgent {
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentRequest {
     pub message: String,
-    pub previous_messages: Vec<String>,
-    pub previous_recommendations: Vec<Vec<i64>>,
+    history: Vec<AgentHistory>,
     pub selected_repositories: Vec<i64>,
     pub repositories: Vec<AgentRepository>,
 }
@@ -264,8 +280,6 @@ struct SessionData {
     turns: Vec<Turn>,
     #[serde(default)]
     expansions: Vec<Expansion>,
-    #[serde(default)]
-    external_readmes: HashMap<i64, String>,
 }
 
 struct SavedSession {
@@ -313,24 +327,14 @@ impl SessionData {
 
 #[derive(Clone)]
 pub struct Conversations {
-    pool: SqlitePool,
+    store: Store,
 }
 
 impl Conversations {
-    pub async fn new(pool: SqlitePool) -> Result<Self> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS agent_sessions (
-                id INTEGER PRIMARY KEY,
-                title TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                revision INTEGER NOT NULL DEFAULT 0,
-                data TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .context("Could not initialize local conversations")?;
-        Ok(Self { pool })
+    pub fn new(store: &Store) -> Self {
+        Self {
+            store: store.clone(),
+        }
     }
 
     pub async fn create(&self, title: &str) -> Result<Session> {
@@ -349,7 +353,7 @@ impl Conversations {
         )
         .bind(title)
         .bind(serde_json::to_string(&data)?)
-        .fetch_one(&self.pool)
+        .fetch_one(self.store.pool())
         .await
         .context("Could not create the local conversation")?;
         Ok(data.into_session(id, title.to_owned(), updated_at))
@@ -359,7 +363,7 @@ impl Conversations {
         let rows = sqlx::query_as::<_, (i64, String, String)>(
             "SELECT id, title, updated_at FROM agent_sessions ORDER BY updated_at DESC, id DESC",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.store.pool())
         .await
         .context("Could not list local conversations")?;
         Ok(rows
@@ -413,13 +417,63 @@ impl Conversations {
         .await
     }
 
-    pub async fn candidate_readme(&self, session_id: i64, repo_id: i64) -> Result<Option<String>> {
+    pub async fn repository_details(
+        &self,
+        repo_id: i64,
+        session_id: Option<i64>,
+    ) -> Result<Option<RepositoryDetails>> {
+        if let Some(repo) = self.store.get_repository(repo_id).await? {
+            let meta = &repo.metadata;
+            let readme = self
+                .store
+                .get_readme_for(repo_id, &meta.full_name, meta.private)
+                .await?
+                .map(|readme| readme.content);
+            return Ok(Some(RepositoryDetails::Library { repo, readme }));
+        }
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let Some(repo) = self.public_candidate(session_id, repo_id).await? else {
+            return Ok(None);
+        };
+        let readme = self.candidate_readme(session_id, repo_id).await?;
+        Ok(Some(RepositoryDetails::Candidate { repo, readme }))
+    }
+
+    pub async fn public_candidate(
+        &self,
+        session_id: i64,
+        repo_id: i64,
+    ) -> Result<Option<Repository>> {
         Ok(self
             .load(session_id)
             .await?
             .data
-            .external_readmes
-            .remove(&repo_id))
+            .external_candidates()
+            .find(|repo| repo.id == repo_id && !repo.private)
+            .cloned())
+    }
+
+    pub async fn candidate_readme(&self, session_id: i64, repo_id: i64) -> Result<Option<String>> {
+        self.read_candidate_readme(session_id, repo_id, false).await
+    }
+
+    async fn read_candidate_readme(
+        &self,
+        session_id: i64,
+        repo_id: i64,
+        verified_only: bool,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT content FROM candidate_readmes
+             WHERE session_id = ? AND repository_id = ? AND (NOT ? OR identity_verified)",
+        )
+        .bind(session_id)
+        .bind(repo_id)
+        .bind(verified_only)
+        .fetch_optional(self.store.pool())
+        .await?)
     }
 
     /// Cache a README fetched anonymously for a public search candidate in this session.
@@ -429,17 +483,19 @@ impl Conversations {
         repo_id: i64,
         readme: &str,
     ) -> Result<()> {
-        let saved = self.load(session_id).await?;
         ensure!(
-            saved
-                .data
-                .external_candidates()
-                .any(|repo| repo.id == repo_id),
+            self.public_candidate(session_id, repo_id).await?.is_some(),
             "This repository is not a public search candidate in the conversation"
         );
-        self.update(session_id, |data| {
-            data.external_readmes.insert(repo_id, readme.to_owned());
-        })
+        sqlx::query(
+            "INSERT INTO candidate_readmes (session_id, repository_id, content, identity_verified)
+             VALUES (?, ?, ?, TRUE) ON CONFLICT(session_id, repository_id) DO UPDATE SET
+                 content = excluded.content, identity_verified = TRUE",
+        )
+        .bind(session_id)
+        .bind(repo_id)
+        .bind(readme)
+        .execute(self.store.pool())
         .await?;
         Ok(())
     }
@@ -495,136 +551,14 @@ impl Conversations {
             "Enter a message to send to the agent"
         );
         let mut saved = self.load(session_id).await?;
-        let mut candidates = library
-            .repositories()
-            .await
-            .context("Could not read the library")?;
-        let local_ids: HashSet<_> = candidates.iter().map(|repo| repo.id).collect();
-        let selections: HashMap<_, _> = saved
-            .data
-            .context
-            .iter()
-            .map(|item| (item.repo_id, item))
-            .collect();
-        let previous_candidates: HashSet<_> = saved
-            .data
-            .turns
-            .iter()
-            .flat_map(|turn| turn.candidates.iter().map(|repo| repo.id))
-            .chain(saved.data.external_candidates().map(|repo| repo.id))
-            .collect();
-        candidates.retain(|repo| {
-            let selection = selections.get(&repo.id);
-            if repo.private {
-                return selection.is_some_and(|item| item.include_private);
-            }
-            repo.starred || selection.is_some() || previous_candidates.contains(&repo.id)
-        });
-        // The current library's visibility always takes precedence over a public search snapshot.
-        candidates.extend(
-            saved
-                .data
-                .external_candidates()
-                .filter(|repo| !local_ids.contains(&repo.id))
-                .cloned(),
-        );
-        let terms: HashSet<_> = message
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|term| term.chars().count() >= 3)
-            .map(str::to_lowercase)
-            .collect();
-        // Keep all eligible metadata. Spend the README budget on selections, earlier candidates,
-        // and repositories whose public or expressly granted metadata matches the current message.
-        candidates.sort_by_cached_key(|repo| {
-            let metadata = format!(
-                "{} {} {} {}",
-                repo.full_name,
-                repo.description.as_deref().unwrap_or_default(),
-                repo.language.as_deref().unwrap_or_default(),
-                repo.topics.join(" ")
-            )
-            .to_lowercase();
-            let matches = terms
-                .iter()
-                .filter(|term| metadata.contains(term.as_str()))
-                .count();
-            std::cmp::Reverse((
-                selections.contains_key(&repo.id),
-                previous_candidates.contains(&repo.id),
-                matches,
-            ))
-        });
-        let mut readme_budget = 48 * 1024;
-        let mut repositories = Vec::new();
-        for repo in &mut candidates {
-            let allowed_note = selections
-                .get(&repo.id)
-                .is_some_and(|item| item.include_notes);
-            let note = repo.note.take().filter(|_| allowed_note);
-            let mut readme = None;
-            if readme_budget > 0 && local_ids.contains(&repo.id) {
-                readme = library
-                    .cached_readme(repo.id)
-                    .await
-                    .context("Could not read the cached README")?;
-            } else if readme_budget > 0 && selections.contains_key(&repo.id) {
-                readme = saved.data.external_readmes.get(&repo.id).cloned();
-            }
-            let readme = readme.and_then(|mut readme| {
-                let mut end = readme.len().min(readme_budget).min(4 * 1024);
-                while !readme.is_char_boundary(end) {
-                    end -= 1;
-                }
-                readme.truncate(end);
-                readme_budget -= end;
-                (!readme.is_empty()).then_some(readme)
-            });
-            repositories.push(AgentRepository {
-                id: repo.id,
-                full_name: repo.full_name.clone(),
-                description: repo.description.clone(),
-                language: repo.language.clone(),
-                topics: repo.topics.clone(),
-                starred: repo.starred,
-                readme,
-                note,
-            });
-        }
-        let supplied_ids: HashSet<_> = repositories.iter().map(|repo| repo.id).collect();
-        let request = AgentRequest {
-            message: message.to_owned(),
-            // Generated prose and quotations can contain material whose grant has since been revoked.
-            previous_messages: saved
-                .data
-                .turns
-                .iter()
-                .map(|turn| turn.message.clone())
-                .collect(),
-            previous_recommendations: saved
-                .data
-                .turns
-                .iter()
-                .map(|turn| {
-                    turn.candidates
-                        .iter()
-                        .map(|repo| repo.id)
-                        .filter(|id| supplied_ids.contains(id))
-                        .collect()
-                })
-                .collect(),
-            selected_repositories: saved
-                .data
-                .context
-                .iter()
-                .map(|selection| selection.repo_id)
-                .filter(|id| supplied_ids.contains(id))
-                .collect(),
-            repositories,
-        };
+        let (request, candidates, input_scope) =
+            self.assemble_request(&saved, message, library).await?;
+        // Cross-process consent edits must finish before this check or retry after the reply is saved.
+        let _handoff = self.store.lock_conversation(session_id).await?;
         let revision =
             sqlx::query_scalar::<_, i64>("SELECT revision FROM agent_sessions WHERE id = ?")
                 .bind(session_id)
-                .fetch_one(&self.pool)
+                .fetch_one(self.store.pool())
                 .await
                 .context("Could not verify the conversation context")?;
         ensure!(
@@ -638,6 +572,7 @@ impl Conversations {
             message: request.message,
             response,
             candidates,
+            input_scope: Some(input_scope),
         });
         ensure!(
             self.save(&mut saved).await?,
@@ -647,15 +582,14 @@ impl Conversations {
     }
 
     async fn update(&self, session_id: i64, change: impl Fn(&mut SessionData)) -> Result<Session> {
-        // Retry local writes against the latest snapshot without repeating any external call.
-        for _ in 0..8 {
-            let mut saved = self.load(session_id).await?;
-            change(&mut saved.data);
-            if self.save(&mut saved).await? {
-                return Ok(saved.into_session());
-            }
-        }
-        anyhow::bail!("The conversation is busy. Reload it and retry the change")
+        let _edit = self.store.lock_conversation(session_id).await?;
+        let mut saved = self.load(session_id).await?;
+        change(&mut saved.data);
+        ensure!(
+            self.save(&mut saved).await?,
+            "The conversation changed. Reload it and retry the change"
+        );
+        Ok(saved.into_session())
     }
 
     async fn load(&self, session_id: i64) -> Result<SavedSession> {
@@ -664,7 +598,7 @@ impl Conversations {
                 "SELECT title, updated_at, data, revision FROM agent_sessions WHERE id = ?",
             )
             .bind(session_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.store.pool())
             .await
             .context("Could not read the local conversation")?
             .with_context(|| format!("Conversation {session_id} was not found"))?;
@@ -687,7 +621,7 @@ impl Conversations {
         .bind(serde_json::to_string(&session.data)?)
         .bind(session.id)
         .bind(session.revision)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.store.pool())
         .await
         .context("Could not save the local conversation")?;
         if let Some(updated_at) = updated {
@@ -747,10 +681,89 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    async fn test_conversations() -> Result<(tempfile::TempDir, Conversations)> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("library.sqlite")).await?;
+        Ok((dir, Conversations::new(&store)))
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_conversations_and_keeps_unverified_readmes_local() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("library.sqlite");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let old_pool = sqlx::SqlitePool::connect_with(options).await?;
+        let old_schema = dir.path().join("migrations");
+        std::fs::create_dir(&old_schema)?;
+        std::fs::write(
+            old_schema.join("0001_library.sql"),
+            include_str!("../migrations/0001_library.sql"),
+        )?;
+        sqlx::migrate::Migrator::new(old_schema)
+            .await?
+            .run(&old_pool)
+            .await?;
+        sqlx::raw_sql("CREATE TABLE agent_sessions (
+            id INTEGER PRIMARY KEY, title TEXT NOT NULL, updated_at TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL
+        );
+        INSERT INTO repositories (id, full_name, private, starred, html_url)
+            VALUES (1, 'fixture/private', TRUE, TRUE, 'https://github.com/fixture/private');
+        INSERT INTO repository_readmes VALUES (1, 'legacy-private-sentinel', 'https://github.com/fixture/private');")
+            .execute(&old_pool).await?;
+        sqlx::query("INSERT INTO agent_sessions VALUES (7, 'Saved comparison', '2026-01-01', 5, ?)")
+            .bind(serde_json::json!({
+                "agent_id": "pi", "context": [
+                    {"repo_id": 1, "include_private": true, "include_notes": false},
+                    {"repo_id": 9, "include_private": false, "include_notes": false}
+                ], "turns": [{
+                    "sequence": 1, "message": "Find candidates", "candidates": [],
+                    "response": {"text": "legacy-reply-sentinel", "recommendations": [], "gaps": []}
+                }], "expansions": [{
+                    "sequence": 2, "public_query": "find search", "candidates": [repository(9, "fixture/external")]
+                }], "external_readmes": {"9": "legacy-external-sentinel"}
+            }).to_string())
+            .execute(&old_pool).await?;
+        old_pool.close().await;
+
+        let store = Store::open(&path).await?;
+        let conversations = Conversations::new(&store);
+        let loaded = conversations.get(7).await?;
+        assert_eq!(loaded.title, "Saved comparison");
+        assert_eq!(loaded.turns[0].response.text, "legacy-reply-sentinel");
+        assert_eq!(
+            conversations.candidate_readme(7, 9).await?.as_deref(),
+            Some("legacy-external-sentinel")
+        );
+        assert_eq!(
+            store.get_readme(1).await?.unwrap().content,
+            "legacy-private-sentinel"
+        );
+        let agent = RecordingAgent {
+            requests: Mutex::default(),
+            answer: Some(AgentResponse {
+                text: "Compare next".into(),
+                recommendations: vec![],
+                gaps: vec![],
+            }),
+        };
+        let library = crate::runtime::AgentLibrary::load(&store).await?;
+        let compared = conversations
+            .ask(7, "Continue the comparison", &library, &agent)
+            .await?;
+        assert_eq!(compared.turns[1].sequence, 3);
+        let payload = serde_json::to_string(&agent.requests.lock().unwrap()[0])?;
+        assert!(payload.contains("fixture/private"));
+        assert!(payload.contains("fixture/external"));
+        assert!(!payload.contains("legacy-"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn creates_and_lists_separate_conversations() -> anyhow::Result<()> {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
-        let conversations = Conversations::new(pool).await?;
+        let (_dir, conversations) = test_conversations().await?;
         let first = conversations.create("中文离线搜索").await?;
         let second = conversations.create("Image editor").await?;
 
@@ -789,12 +802,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keeps_starred_metadata_available_and_prioritizes_explicit_readmes() -> Result<()> {
+    async fn ranks_the_full_library_and_bounds_the_serialized_request() -> Result<()> {
         struct LargeLibrary;
         impl Library for LargeLibrary {
             async fn repositories(&self) -> Result<Vec<Repository>> {
-                Ok((1..=30)
-                    .map(|id| repository(id, &format!("example/repo-{id}")))
+                Ok((1..=750)
+                    .map(|id| {
+                        let mut repo = repository(id, &format!("example/repo-{id}"));
+                        let prefix = if id == 750 {
+                            "中文离线搜索"
+                        } else {
+                            "Other project"
+                        };
+                        repo.description = Some(format!("{prefix} {}", "\"分\n".repeat(100)));
+                        repo.note = Some("分".repeat(10_000));
+                        repo
+                    })
                     .collect())
             }
 
@@ -803,8 +826,7 @@ mod tests {
             }
         }
 
-        let conversations =
-            Conversations::new(SqlitePool::connect("sqlite::memory:").await?).await?;
+        let (_dir, conversations) = test_conversations().await?;
         let session = conversations.create("A larger library").await?;
         conversations
             .set_context(
@@ -812,7 +834,7 @@ mod tests {
                 ContextSelection {
                     repo_id: 30,
                     include_private: false,
-                    include_notes: false,
+                    include_notes: true,
                 },
             )
             .await?;
@@ -824,25 +846,39 @@ mod tests {
                 gaps: vec![],
             }),
         };
+        for _ in 0..11 {
+            conversations
+                .ask(
+                    session.id,
+                    &"Long prior prompt ".repeat(100),
+                    &LargeLibrary,
+                    &agent,
+                )
+                .await?;
+        }
         conversations
-            .ask(session.id, "Compare options", &LargeLibrary, &agent)
+            .ask(
+                session.id,
+                "我想为桌面应用增加中文离线搜索",
+                &LargeLibrary,
+                &agent,
+            )
             .await?;
 
         let requests = agent.requests.lock().unwrap();
-        let repositories = &requests[0].repositories;
-        assert_eq!(repositories.len(), 30);
-        let selected = repositories.iter().find(|repo| repo.id == 30).unwrap();
+        let request = requests.last().unwrap();
+        assert!(serde_json::to_vec(request)?.len() <= 32 * 1024);
+        let repositories = &request.repositories;
+        assert_eq!(repositories[0].id, 30);
+        assert_eq!(repositories[1].id, 750);
+        let selected = &repositories[0];
         assert!(selected
             .readme
             .as_deref()
             .unwrap()
             .starts_with("README for 30"));
-        let readme_bytes: usize = repositories
-            .iter()
-            .filter_map(|repo| repo.readme.as_ref())
-            .map(String::len)
-            .sum();
-        assert!(readme_bytes <= 49_152, "README excerpts exceeded 48 KiB");
+        assert!(selected.note.is_some());
+        assert!(repositories[1].note.is_none());
         Ok(())
     }
 
@@ -862,8 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn recommends_a_star_with_checkable_evidence_and_records_gaps() -> Result<()> {
-        let conversations =
-            Conversations::new(SqlitePool::connect("sqlite::memory:").await?).await?;
+        let (_dir, conversations) = test_conversations().await?;
         let session = conversations.create("中文离线搜索").await?;
         let library = TestLibrary(vec![repository(1, "example/segmenter")]);
         let agent = RecordingAgent {
@@ -915,8 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn scopes_private_repos_and_notes_to_current_explicit_grants() -> Result<()> {
-        let conversations =
-            Conversations::new(SqlitePool::connect("sqlite::memory:").await?).await?;
+        let (_dir, conversations) = test_conversations().await?;
         let session = conversations
             .create_with_agent("Scoped", Some("pi"))
             .await?;
@@ -927,14 +961,23 @@ mod tests {
         let mut public = repository(2, "example/search");
         public.note = Some("confidential public note".into());
         let library = TestLibrary(vec![private, public]);
-        let agent = RecordingAgent {
-            requests: Mutex::default(),
-            answer: Some(AgentResponse {
-                text: "A confidential private note is historical assistant output.".into(),
-                recommendations: vec![],
-                gaps: vec!["No documented comparison".into()],
-            }),
-        };
+        #[derive(Default)]
+        struct ScopeAgent(Mutex<Vec<AgentRequest>>);
+        impl Agent for ScopeAgent {
+            async fn respond(&self, request: &AgentRequest) -> Result<AgentResponse> {
+                self.0.lock().unwrap().push(request.clone());
+                Ok(AgentResponse {
+                    text: request
+                        .repositories
+                        .iter()
+                        .find_map(|repo| repo.note.clone())
+                        .unwrap_or_else(|| "No note was supplied".into()),
+                    recommendations: vec![],
+                    gaps: vec!["No documented comparison".into()],
+                })
+            }
+        }
+        let agent = ScopeAgent::default();
 
         conversations
             .ask(session.id, "Find options", &library, &agent)
@@ -997,7 +1040,7 @@ mod tests {
             .ask(session.id, "Compare again", &library, &agent)
             .await?;
 
-        let requests = agent.requests.lock().unwrap();
+        let requests = agent.0.lock().unwrap();
         for index in [0, 4, 5] {
             let payload = serde_json::to_string(&requests[index])?;
             assert!(!payload.contains("confidential"));
@@ -1030,11 +1073,9 @@ mod tests {
     #[tokio::test]
     async fn searches_once_with_public_terms_and_reuses_results_after_reopening() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(directory.path().join("starchive.sqlite"))
-            .create_if_missing(true);
-        let pool = sqlx::SqlitePool::connect_with(options.clone()).await?;
-        let conversations = Conversations::new(pool.clone()).await?;
+        let path = directory.path().join("starchive.sqlite");
+        let store = Store::open(&path).await?;
+        let conversations = Conversations::new(&store);
         let session = conversations
             .create_with_agent("Search", Some("pi"))
             .await?;
@@ -1070,8 +1111,9 @@ mod tests {
             .expand(session.id, "  Rust full-text search  ", &search)
             .await?;
         assert_eq!(*search.0.lock().unwrap(), ["Rust full-text search"]);
-        pool.close().await;
-        let conversations = Conversations::new(SqlitePool::connect_with(options).await?).await?;
+        drop(conversations);
+        store.pool().close().await;
+        let conversations = Conversations::new(&Store::open(&path).await?);
         let loaded = conversations.get(session.id).await?;
         assert_eq!(loaded.agent_id.as_deref(), Some("pi"));
         assert_eq!(loaded.turns[0].message, "Find tools for secret/desktop");
@@ -1115,8 +1157,7 @@ mod tests {
 
     #[tokio::test]
     async fn verifies_evidence_and_reuses_prior_recommendations_in_order() -> Result<()> {
-        let conversations =
-            Conversations::new(SqlitePool::connect("sqlite::memory:").await?).await?;
+        let (_dir, conversations) = test_conversations().await?;
         let session = conversations
             .create("Compare offline search libraries")
             .await?;
@@ -1173,14 +1214,100 @@ mod tests {
             [2, 1]
         );
         let requests = invalid.requests.lock().unwrap();
-        assert_eq!(requests[0].previous_recommendations, [vec![2, 1]]);
+        let payload = serde_json::to_string(&requests[0])?;
+        assert!(payload.contains("Two options, in order of fit."));
+        assert!(payload.contains("Supports offline search"));
+        let second = payload.find("\"repo_id\":2").unwrap();
+        assert!(second < payload.find("\"repo_id\":1").unwrap());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_reply_serializes_grants_but_allows_candidate_readme_caching() -> Result<()>
+    {
+        struct WaitingAgent {
+            started: tokio::sync::Notify,
+            finish: tokio::sync::Notify,
+        }
+        impl Agent for WaitingAgent {
+            async fn respond(&self, _: &AgentRequest) -> Result<AgentResponse> {
+                self.started.notify_one();
+                self.finish.notified().await;
+                Ok(AgentResponse {
+                    text: "Compared".into(),
+                    recommendations: vec![],
+                    gaps: vec![],
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("library.sqlite");
+        let store = crate::Store::open(&path).await?;
+        let second_store = crate::Store::open(&path).await?;
+        let conversations = Conversations::new(&store);
+        let other = Conversations::new(&second_store);
+        let session = conversations.create("Review").await?;
+        let library = TestLibrary(vec![]);
+        let initial = RecordingAgent {
+            requests: Mutex::default(),
+            answer: Some(AgentResponse {
+                text: "Initial".into(),
+                recommendations: vec![],
+                gaps: vec![],
+            }),
+        };
+        conversations
+            .ask(session.id, "Find options", &library, &initial)
+            .await?;
+        let search = RecordingSearch(Mutex::default(), vec![repository(2, "example/fts")]);
+        conversations
+            .expand(session.id, "offline search", &search)
+            .await?;
+        conversations
+            .set_context(
+                session.id,
+                ContextSelection {
+                    repo_id: 2,
+                    include_private: false,
+                    include_notes: false,
+                },
+            )
+            .await?;
+        let agent = WaitingAgent {
+            started: Default::default(),
+            finish: Default::default(),
+        };
+        let (reply, (revoke, cache)) = tokio::join!(
+            conversations.ask(session.id, "Compare the candidate", &library, &agent),
+            async {
+                agent.started.notified().await;
+                let revoke = other.remove_context(session.id, 2).await;
+                let cache = other
+                    .cache_candidate_readme(session.id, 2, "Cached during reply")
+                    .await;
+                agent.finish.notify_one();
+                (revoke, cache)
+            }
+        );
+        assert!(revoke.unwrap_err().to_string().contains("busy"));
+        cache?;
+        assert_eq!(reply?.turns[1].response.text, "Compared");
+        assert!(other
+            .remove_context(session.id, 2)
+            .await?
+            .context
+            .is_empty());
+        assert_eq!(
+            other.candidate_readme(session.id, 2).await?.as_deref(),
+            Some("Cached during reply")
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn external_readme_enters_context_only_when_the_candidate_is_selected() -> Result<()> {
-        let conversations =
-            Conversations::new(SqlitePool::connect("sqlite::memory:").await?).await?;
+        let (_dir, conversations) = test_conversations().await?;
         let session = conversations.create("Find search projects").await?;
         let library = TestLibrary(vec![]);
         let agent = RecordingAgent {
@@ -1238,6 +1365,53 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn pi_subprocess_does_not_inherit_the_github_token() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("pi");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+cat >/dev/null
+[ "${STARCHIVE_GITHUB_TOKEN+x}" = "" ] || exit 6
+printf '%s\n' '{"text":"The credential is absent","recommendations":[],"gaps":[]}'
+"#,
+        )?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        // Set the sentinel only in a child test process, keeping the test runner's environment safe.
+        if std::env::var_os("STARCHIVE_PI_ENV_TEST").is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "agent::tests::pi_subprocess_does_not_inherit_the_github_token",
+                ])
+                .env("STARCHIVE_PI_ENV_TEST", "1")
+                .env("STARCHIVE_GITHUB_TOKEN", "fake-github-token-sentinel")
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return Ok(());
+        }
+        let request = AgentRequest {
+            message: "Check credentials".into(),
+            history: vec![],
+            selected_repositories: vec![],
+            repositories: vec![],
+        };
+        assert_eq!(
+            PiAgent::new(path).respond(&request).await?.text,
+            "The credential is absent"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn pi_process_failure_preserves_history_and_a_configured_executable_can_retry(
     ) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
@@ -1245,8 +1419,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("configured pi with spaces");
         let failure = PiAgent::new(&path);
-        let conversations =
-            Conversations::new(SqlitePool::connect("sqlite::memory:").await?).await?;
+        let (_dir, conversations) = test_conversations().await?;
         let session = conversations.create("Local pi").await?;
         let library = TestLibrary(vec![]);
         let initial = RecordingAgent {

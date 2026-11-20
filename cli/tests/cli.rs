@@ -19,6 +19,37 @@ fn cli(db: &Path, args: &[&str]) -> Result<Value> {
 }
 
 #[tokio::test]
+async fn malformed_credentials_record_a_failed_sync_and_preserve_the_last_success() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("library.sqlite3");
+    let store = Store::open(&db).await?;
+    store
+        .try_sync_lease()
+        .await?
+        .unwrap()
+        .complete_snapshot(&[])
+        .await?;
+    let before = cli(&db, &["status"])?;
+
+    let failure = Command::new(env!("CARGO_BIN_EXE_starchive"))
+        .arg("--db")
+        .arg(&db)
+        .arg("sync")
+        .env("STARCHIVE_GITHUB_TOKEN", "malformed credential sentinel")
+        .output()?;
+    assert!(!failure.status.success());
+    assert!(!String::from_utf8_lossy(&failure.stderr).contains("sentinel"));
+    let after = cli(&db, &["status"])?;
+    assert_eq!(after["last_successful_at"], before["last_successful_at"]);
+    assert_eq!(after["in_progress"], false);
+    assert!(after["last_error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("invalid characters"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn search_and_edit_use_the_shared_library() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("library.sqlite3");

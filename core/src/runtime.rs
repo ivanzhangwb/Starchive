@@ -124,7 +124,7 @@ impl agent::Library for AgentLibrary<'_> {
         };
         Ok(self
             .store
-            .get_readme_for(repo.id, &repo.full_name, repo.private)
+            .verified_readme_for(repo.id, &repo.full_name, repo.private)
             .await?
             .map(|readme| readme.content))
     }

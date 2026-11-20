@@ -1,14 +1,12 @@
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use starchive_core::{
-    agent::{ContextSelection, Conversations, PiAgent, Session},
+    agent::{ContextSelection, Conversations, PiAgent, RepositoryDetails, Session},
     github::GitHub,
+    library::{FieldEdit, PatchResult},
     runtime::{self, AgentLibrary},
     RepoQuery, Store,
 };
@@ -51,11 +49,12 @@ enum Action {
     },
     RepoGet {
         repo_id: Id,
+        session_id: Option<Id>,
     },
     RepoUpdate {
         repo_id: Id,
-        note: String,
-        tags: Vec<String>,
+        note: Option<FieldEdit<String>>,
+        tags: Option<FieldEdit<Vec<String>>>,
     },
     RepoReadme {
         repo_id: Id,
@@ -109,7 +108,7 @@ pub struct Desktop {
 impl Desktop {
     pub async fn open(path: &Path, pi_path: PathBuf) -> Result<Self> {
         let store = Store::open(path).await?;
-        let conversations = Conversations::new(store.pool().clone()).await?;
+        let conversations = Conversations::new(&store);
         Ok(Self {
             store,
             conversations,
@@ -136,60 +135,54 @@ impl Desktop {
                     StarStatus::Unstarred => Some(false),
                     StarStatus::All => None,
                 };
-                let base = RepoQuery {
-                    starred,
-                    ..RepoQuery::default()
-                };
-                let unfiltered = store.list_repositories(&base).await?;
-                let languages: BTreeSet<_> = unfiltered
-                    .iter()
-                    .filter_map(|repo| repo.metadata.language.clone())
-                    .collect();
-                let tags: BTreeSet<_> = unfiltered
-                    .iter()
-                    .flat_map(|repo| repo.tags.iter().cloned())
-                    .collect();
-                let repos = if query.trim().is_empty() && language.is_none() && tag.is_none() {
-                    unfiltered
-                } else {
-                    store
-                        .list_repositories(&RepoQuery {
+                let page = store
+                    .page_repositories(
+                        &RepoQuery {
                             query: Some(query),
                             language,
                             tag,
-                            ..base
-                        })
-                        .await?
-                };
-                let page: Vec<_> = repos
-                    .iter()
-                    .skip(offset)
-                    .take(limit)
-                    .map(view::library_repo)
-                    .collect();
+                            starred,
+                            ..RepoQuery::default()
+                        },
+                        offset,
+                        limit,
+                    )
+                    .await?;
+                let repos: Vec<_> = page.repositories.iter().map(view::library_repo).collect();
                 Ok(
-                    json!({"repos": page, "total": repos.len(), "languages": languages, "tags": tags}),
+                    json!({"repos": repos, "total": page.total, "languages": page.languages, "tags": page.tags}),
                 )
             }
-            Action::RepoGet { repo_id: Id(id) } => {
-                let Some(repo) = store.get_repository(id).await? else {
-                    return Ok(Value::Null);
-                };
-                let meta = &repo.metadata;
-                let readme = store
-                    .get_readme_for(id, &meta.full_name, meta.private)
+            Action::RepoGet {
+                repo_id: Id(id),
+                session_id,
+            } => Ok(
+                match sessions
+                    .repository_details(id, session_id.map(|id| id.0))
                     .await?
-                    .map(|readme| readme.content);
-                Ok(json!({"repo": view::library_repo(&repo), "readme": readme}))
-            }
+                {
+                    Some(RepositoryDetails::Library { repo, readme }) => {
+                        json!({"repo": view::library_repo(&repo), "readme": readme, "editable": true})
+                    }
+                    Some(RepositoryDetails::Candidate { repo, readme }) => {
+                        json!({"repo": view::candidate_repo(&repo, None), "readme": readme, "editable": false})
+                    }
+                    None => Value::Null,
+                },
+            ),
             Action::RepoUpdate {
                 repo_id: Id(id),
                 note,
                 tags,
             } => {
-                let repo = store.edit_repository(id, Some(&note), Some(&tags)).await?;
-                let repo = json!(view::library_repo(&repo));
-                Ok(repo)
+                let result = store
+                    .patch_repository(id, note.as_ref(), tags.as_ref())
+                    .await?;
+                let (status, repo) = match result {
+                    PatchResult::Saved(repo) => ("saved", repo),
+                    PatchResult::Conflict(repo) => ("conflict", repo),
+                };
+                Ok(json!({"status": status, "repo": view::library_repo(&repo)}))
             }
             Action::RepoReadme {
                 repo_id: Id(id),
@@ -200,7 +193,7 @@ impl Desktop {
             }
             Action::SyncStatus {} => Ok(view::sync_status(store.sync_status().await?)),
             Action::SyncStart {} => {
-                GitHub::from_env()?.sync(store).await?;
+                GitHub::sync_from_env(store).await?;
                 Ok(view::sync_status(store.sync_status().await?))
             }
             Action::AgentList {} => Ok(json!([{
@@ -242,7 +235,8 @@ impl Desktop {
             } => {
                 let local = store.get_repository(repo_id).await?;
                 if local.is_none() {
-                    self.public_candidate(session_id, repo_id).await?;
+                    ensure!(sessions.public_candidate(session_id, repo_id).await?.is_some(),
+                        "Repository is not in the local library or this conversation's public search results");
                 }
                 let selection = ContextSelection {
                     repo_id,
@@ -305,16 +299,6 @@ impl Desktop {
         view::session(&self.store, session).await
     }
 
-    async fn public_candidate(
-        &self,
-        session_id: i64,
-        repo_id: i64,
-    ) -> Result<starchive_core::agent::Repository> {
-        self.conversations.get(session_id).await?.external_candidates.into_iter()
-            .find(|repo| repo.id == repo_id && !repo.private)
-            .context("Repository is not in the local library or this conversation's public search results")
-    }
-
     async fn fetch_readme(&self, repo_id: i64, session_id: Option<Id>) -> Result<Option<String>> {
         if let Some(repo) = self.store.get_repository(repo_id).await? {
             return Ok(runtime::refresh_readme(&self.store, &repo.metadata)
@@ -323,8 +307,14 @@ impl Desktop {
         }
         let Id(session_id) =
             session_id.context("Select a saved repository or a public search candidate")?;
-        let candidate = self.public_candidate(session_id, repo_id).await?;
-        let Some(readme) = GitHub::new(None)?.readme(&candidate.full_name).await? else {
+        ensure!(
+            self.conversations
+                .public_candidate(session_id, repo_id)
+                .await?
+                .is_some(),
+            "Repository is not in the local library or this conversation's public search results"
+        );
+        let Some(readme) = GitHub::new(None)?.readme(repo_id).await? else {
             return self
                 .conversations
                 .candidate_readme(session_id, repo_id)

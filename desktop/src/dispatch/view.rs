@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{json, Value};
-use starchive_core::{agent, RepoQuery, Repository, Store, SyncStatus};
+use starchive_core::{agent, Repository, Store, SyncStatus};
 
 #[derive(Serialize)]
-struct Repo<'a> {
+pub(super) struct Repo<'a> {
     id: String,
     full_name: &'a str,
     description: Option<&'a str>,
@@ -31,14 +31,20 @@ impl<'a> From<&'a Repository> for Repo<'a> {
     }
 }
 
-fn candidate_repo<'a>(repo: &'a agent::Repository, library: &HashMap<i64, Repository>) -> Repo<'a> {
+pub(super) fn candidate_repo<'a>(
+    repo: &'a agent::Repository,
+    current: Option<&'a Repository>,
+) -> Repo<'a> {
+    if let Some(current) = current {
+        return current.into();
+    }
     Repo {
         id: repo.id.to_string(),
         full_name: &repo.full_name,
         description: repo.description.as_deref(),
         language: repo.language.as_deref(),
         url: &repo.html_url,
-        starred: library.get(&repo.id).is_some_and(|current| current.starred),
+        starred: false,
         private: repo.private,
     }
 }
@@ -75,8 +81,26 @@ pub fn session_summary(session: &agent::SessionSummary) -> Value {
 }
 
 pub async fn session(store: &Store, session: agent::Session) -> Result<Value> {
+    let ids: HashSet<_> = session
+        .context
+        .iter()
+        .map(|item| item.repo_id)
+        .chain(
+            session
+                .turns
+                .iter()
+                .flat_map(|turn| turn.candidates.iter().map(|repo| repo.id)),
+        )
+        .chain(
+            session
+                .expansions
+                .iter()
+                .flat_map(|expansion| expansion.candidates.iter().map(|repo| repo.id)),
+        )
+        .collect();
+    let ids: Vec<_> = ids.into_iter().collect();
     let library: HashMap<_, _> = store
-        .list_repositories(&RepoQuery::default())
+        .repositories_by_id(&ids)
         .await?
         .into_iter()
         .map(|repo| (repo.metadata.id, repo))
@@ -90,7 +114,7 @@ pub async fn session(store: &Store, session: agent::Session) -> Result<Value> {
         let repo = if let Some(repo) = library.get(&selection.repo_id) {
             Repo::from(repo)
         } else {
-            candidate_repo(external.get(&selection.repo_id)?, &library)
+            candidate_repo(external.get(&selection.repo_id)?, None)
         };
         Some(json!({"repo": repo, "include_private": selection.include_private, "include_notes": selection.include_notes}))
     }).collect();
@@ -112,7 +136,7 @@ pub async fn session(store: &Store, session: agent::Session) -> Result<Value> {
             .zip(&turn.candidates)
             .map(|(recommendation, repo)| {
                 json!({
-                    "repo": candidate_repo(repo, &library), "fit": recommendation.fit,
+                    "repo": candidate_repo(repo, library.get(&repo.id)), "fit": recommendation.fit,
                     "evidence": recommendation.evidence, "gaps": recommendation.gaps,
                 })
             })
@@ -124,7 +148,7 @@ pub async fn session(store: &Store, session: agent::Session) -> Result<Value> {
     }
     for expansion in &session.expansions {
         let candidates: Vec<_> = expansion.candidates.iter().map(|repo| json!({
-            "repo": candidate_repo(repo, &library), "fit": repo.description.as_deref().unwrap_or_default(),
+            "repo": candidate_repo(repo, library.get(&repo.id)), "fit": repo.description.as_deref().unwrap_or_default(),
             "evidence": [], "gaps": [],
         })).collect();
         messages.push((expansion.sequence, json!({
