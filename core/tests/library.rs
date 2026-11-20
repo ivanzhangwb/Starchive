@@ -190,7 +190,13 @@ async fn remote_and_storage_failures_preserve_last_success_and_allow_retry() -> 
 
     let transient = repo(2, "example/new");
     let invalid = repo(0, "example/invalid");
-    assert!(sync(&store, &[transient.clone(), invalid]).await.is_err());
+    let failure = sync(&store, &[transient.clone(), invalid])
+        .await
+        .unwrap_err();
+    assert!(
+        failure.to_string().contains("Save GitHub repository 0"),
+        "{failure:#}"
+    );
     assert!(store.get_repository(2).await?.is_none());
     let previous = store.get_repository(original.id).await?.unwrap();
     assert_eq!(previous.metadata, original);

@@ -332,8 +332,24 @@ impl GitHub {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     }
 
+    /// Check that a URL identifies a repository on github.com before opening it.
+    pub fn repository_url(value: &str) -> Result<Url, GitHubError> {
+        let url = Self::web_url(value, "repository")?;
+        let valid_path = url
+            .path()
+            .strip_prefix('/')
+            .and_then(|path| path.split_once('/'))
+            .is_some_and(|(owner, repo)| {
+                Self::valid_name_part(owner) && Self::valid_name_part(repo)
+            });
+        if !valid_path {
+            return Err(GitHubError::InvalidUrl("repository"));
+        }
+        Ok(url)
+    }
+
     fn validate_repo_url(repo: &GitHubRepo) -> Result<(), GitHubError> {
-        let url = Self::web_url(&repo.html_url, "repository")?;
+        let url = Self::repository_url(&repo.html_url)?;
         if !url
             .path()
             .trim_start_matches('/')
