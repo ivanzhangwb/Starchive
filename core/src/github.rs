@@ -1,0 +1,881 @@
+use std::{collections::HashSet, time::Duration};
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use reqwest::{redirect::Policy, Client, Response, StatusCode, Url};
+use serde::{Deserialize, Serialize};
+
+use crate::{Readme, RepoMetadata, Store, SyncLease, SyncResult};
+
+const API_URL: &str = "https://api.github.com/";
+pub(crate) const TOKEN_ENV: &str = "STARCHIVE_GITHUB_TOKEN";
+
+#[derive(Debug)]
+pub enum GitHubError {
+    Configuration(&'static str),
+    Transport(reqwest::Error),
+    Unauthorized,
+    Forbidden,
+    RateLimited {
+        retry_after: Option<u64>,
+        reset_at: Option<u64>,
+    },
+    Http(StatusCode),
+    InvalidResponse(reqwest::Error),
+    InvalidPagination,
+    InvalidUrl(&'static str),
+    InvalidReadme(&'static str),
+}
+
+impl std::fmt::Display for GitHubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(message) => f.write_str(message),
+            Self::Transport(error) => write!(f, "GitHub request failed: {error}"),
+            Self::Unauthorized => f.write_str("GitHub rejected authentication (HTTP 401). Check or replace STARCHIVE_GITHUB_TOKEN."),
+            Self::Forbidden => f.write_str("GitHub denied access (HTTP 403). Check the credential's read permissions and repository access."),
+            Self::RateLimited { retry_after: Some(seconds), .. } => {
+                write!(f, "GitHub rate limit reached. Retry after {seconds} seconds.")
+            }
+            Self::RateLimited { reset_at: Some(timestamp), .. } => {
+                write!(f, "GitHub rate limit reached. Retry after Unix timestamp {timestamp}.")
+            }
+            Self::RateLimited { .. } => f.write_str("GitHub rate limit reached. Wait before retrying."),
+            Self::Http(status) => write!(f, "GitHub returned HTTP {status}. Retry if the failure is temporary."),
+            Self::InvalidResponse(error) => write!(f, "GitHub returned an unreadable response: {error}"),
+            Self::InvalidPagination => f.write_str("GitHub returned an invalid pagination link. Retry the sync."),
+            Self::InvalidUrl(resource) => write!(f, "GitHub returned an invalid {resource} URL"),
+            Self::InvalidReadme(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for GitHubError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) | Self::InvalidResponse(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubRepo {
+    pub id: i64,
+    pub full_name: String,
+    pub description: Option<String>,
+    pub language: Option<String>,
+    #[serde(default)]
+    pub topics: Vec<String>,
+    pub html_url: String,
+    pub private: bool,
+    pub default_branch: Option<String>,
+    #[serde(default)]
+    pub stargazers_count: i64,
+    pub updated_at: Option<String>,
+    pub starred_at: Option<String>,
+}
+
+impl From<GitHubRepo> for RepoMetadata {
+    fn from(repo: GitHubRepo) -> Self {
+        Self {
+            id: repo.id,
+            full_name: repo.full_name,
+            description: repo.description,
+            language: repo.language,
+            html_url: repo.html_url,
+            private: repo.private,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct GitHub {
+    http: Client,
+    base: Url,
+    token: Option<reqwest::header::HeaderValue>,
+}
+
+impl GitHub {
+    pub fn new(token: Option<&str>) -> Result<Self, GitHubError> {
+        Self::with_base_url(API_URL, token)
+    }
+
+    pub fn from_env() -> Result<Self, GitHubError> {
+        match std::env::var(TOKEN_ENV) {
+            Ok(token) => Self::new(Some(&token)),
+            Err(std::env::VarError::NotPresent) => Self::new(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(GitHubError::Configuration(
+                "STARCHIVE_GITHUB_TOKEN must be valid text",
+            )),
+        }
+    }
+
+    fn with_base_url(base: &str, token: Option<&str>) -> Result<Self, GitHubError> {
+        let base = Url::parse(base)
+            .map_err(|_| GitHubError::Configuration("Invalid GitHub API base URL"))?;
+        let http = Client::builder()
+            .user_agent(concat!("Starchive/", env!("CARGO_PKG_VERSION")))
+            .redirect(Policy::none())
+            .retry(reqwest::retry::never())
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| GitHubError::Transport(error.without_url()))?;
+
+        let token = token.map(str::trim).filter(|token| !token.is_empty());
+        let token = token
+            .map(|token| {
+                if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+                    return Err(GitHubError::Configuration(
+                        "STARCHIVE_GITHUB_TOKEN contains invalid characters",
+                    ));
+                }
+                let mut header = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|_| {
+                        GitHubError::Configuration(
+                            "STARCHIVE_GITHUB_TOKEN contains invalid characters",
+                        )
+                    })?;
+                header.set_sensitive(true);
+                Ok(header)
+            })
+            .transpose()?;
+
+        Ok(Self { http, base, token })
+    }
+
+    /// Record the attempt before reading configuration so setup failures are visible on reopen.
+    pub async fn sync_from_env(store: &Store) -> anyhow::Result<SyncResult> {
+        let lease = Self::sync_lease(store).await?;
+        match Self::from_env() {
+            Ok(client) => client.sync_with_lease(lease).await,
+            Err(error) => Err(lease.fail(error.into()).await),
+        }
+    }
+
+    /// Update the local library only after every page of GitHub stars is available.
+    pub async fn sync(&self, store: &Store) -> anyhow::Result<SyncResult> {
+        self.sync_with_lease(Self::sync_lease(store).await?).await
+    }
+
+    async fn sync_lease(store: &Store) -> anyhow::Result<SyncLease> {
+        store.try_sync_lease().await?.ok_or_else(|| {
+            anyhow::anyhow!("GitHub sync is already in progress. Try again once it finishes.")
+        })
+    }
+
+    async fn sync_with_lease(&self, lease: SyncLease) -> anyhow::Result<SyncResult> {
+        match self.starred().await {
+            Ok(stars) => {
+                let repositories: Vec<_> = stars.into_iter().map(RepoMetadata::from).collect();
+                lease.complete_snapshot(&repositories).await
+            }
+            Err(error) => Err(lease.fail(error.into()).await),
+        }
+    }
+
+    /// Fetch the entire authenticated star list before returning a snapshot.
+    pub async fn starred(&self) -> Result<Vec<GitHubRepo>, GitHubError> {
+        #[derive(Deserialize)]
+        struct Star {
+            starred_at: String,
+            repo: GitHubRepo,
+        }
+
+        let token = self.token.as_ref().ok_or(GitHubError::Configuration(
+            "Set STARCHIVE_GITHUB_TOKEN to a GitHub credential with read access to your stars",
+        ))?;
+        let endpoint = self.base.join("user/starred").expect("valid API endpoint");
+        let mut url = endpoint.clone();
+        url.query_pairs_mut().append_pair("per_page", "100");
+
+        let mut visited = HashSet::new();
+        let mut repositories = Vec::new();
+        loop {
+            if !visited.insert(url.clone()) {
+                return Err(GitHubError::InvalidPagination);
+            }
+            let response = self
+                .get(url.clone(), "application/vnd.github.star+json", Some(token))
+                .await?;
+            let response = Self::check_status(response).await?;
+            let next = Self::next_page(&response, &url, &endpoint)?;
+            for star in Self::json::<Vec<Star>>(response).await? {
+                Self::validate_repo_url(&star.repo)?;
+                repositories.push(GitHubRepo {
+                    starred_at: Some(star.starred_at),
+                    ..star.repo
+                });
+            }
+            match next {
+                Some(next) => url = next,
+                None => return Ok(repositories),
+            }
+        }
+    }
+
+    /// Call only for an explicit search expansion with public search terms.
+    pub async fn search_public(&self, query: &str) -> Result<Vec<GitHubRepo>, GitHubError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(GitHubError::Configuration(
+                "Enter public repository search terms",
+            ));
+        }
+        #[derive(Deserialize)]
+        struct SearchResults {
+            items: Vec<GitHubRepo>,
+        }
+
+        let mut url = self
+            .base
+            .join("search/repositories")
+            .expect("valid API endpoint");
+        url.query_pairs_mut()
+            .append_pair("q", &format!("{query} is:public"));
+        let response = self.get(url, "application/vnd.github+json", None).await?;
+        let response = Self::check_status(response).await?;
+        let mut results = Self::json::<SearchResults>(response).await?.items;
+        results.retain(|repo| !repo.private);
+        for repo in &results {
+            Self::validate_repo_url(repo)?;
+        }
+        Ok(results)
+    }
+
+    /// Fetch the default README for a selected public repository by its stable GitHub ID.
+    pub async fn readme(&self, repository_id: i64) -> Result<Option<String>, GitHubError> {
+        Ok(self
+            .fetch_readme(repository_id, None)
+            .await?
+            .map(|readme| readme.content))
+    }
+
+    /// Fetch and cache the selected repository's README while its saved metadata still matches.
+    pub async fn refresh_readme(
+        &self,
+        store: &Store,
+        repo: &RepoMetadata,
+    ) -> anyhow::Result<Option<Readme>> {
+        let token = if repo.private {
+            Some(self.token.as_ref().ok_or(GitHubError::Configuration(
+                "Set STARCHIVE_GITHUB_TOKEN to a GitHub credential with read access to this private repository's contents",
+            ))?)
+        } else {
+            None
+        };
+        let Some(readme) = self.fetch_readme(repo.id, token).await? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            store.cache_readme(repo, &readme).await?,
+            "The saved repository changed while loading its README. Reopen the repository and retry."
+        );
+        Ok(Some(readme))
+    }
+
+    async fn fetch_readme(
+        &self,
+        repository_id: i64,
+        token: Option<&reqwest::header::HeaderValue>,
+    ) -> Result<Option<Readme>, GitHubError> {
+        #[derive(Deserialize)]
+        struct EncodedReadme {
+            encoding: String,
+            content: String,
+            html_url: String,
+        }
+
+        let url = self
+            .base
+            .join(&format!("repositories/{repository_id}/readme"))
+            .expect("valid API endpoint");
+        let response = self.get(url, "application/vnd.github+json", token).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let readme: EncodedReadme = Self::json(Self::check_status(response).await?).await?;
+        Self::web_url(&readme.html_url, "README")?;
+        if readme.encoding != "base64" {
+            return Err(GitHubError::InvalidReadme(
+                "GitHub returned an unsupported README encoding. Open the README on GitHub.",
+            ));
+        }
+        let encoded: Vec<_> = readme
+            .content
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect();
+        let content = STANDARD
+            .decode(encoded)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or(GitHubError::InvalidReadme(
+                "GitHub returned a README that could not be decoded as UTF-8 text.",
+            ))?;
+        Ok(Some(Readme {
+            content,
+            source_url: readme.html_url,
+        }))
+    }
+
+    fn valid_name_part(part: &str) -> bool {
+        !matches!(part, "" | "." | "..")
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    }
+
+    /// Check that a URL identifies a repository on github.com before opening it.
+    pub fn repository_url(value: &str) -> Result<Url, GitHubError> {
+        let url = Self::web_url(value, "repository")?;
+        let valid_path = url
+            .path()
+            .strip_prefix('/')
+            .and_then(|path| path.split_once('/'))
+            .is_some_and(|(owner, repo)| {
+                Self::valid_name_part(owner) && Self::valid_name_part(repo)
+            });
+        if !valid_path {
+            return Err(GitHubError::InvalidUrl("repository"));
+        }
+        Ok(url)
+    }
+
+    fn validate_repo_url(repo: &GitHubRepo) -> Result<(), GitHubError> {
+        let url = Self::repository_url(&repo.html_url)?;
+        if !url
+            .path()
+            .trim_start_matches('/')
+            .eq_ignore_ascii_case(&repo.full_name)
+        {
+            return Err(GitHubError::InvalidUrl("repository"));
+        }
+        Ok(())
+    }
+
+    fn web_url(value: &str, resource: &'static str) -> Result<Url, GitHubError> {
+        let url = Url::parse(value).map_err(|_| GitHubError::InvalidUrl(resource))?;
+        if url.scheme() != "https"
+            || url.host_str() != Some("github.com")
+            || url.port().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(GitHubError::InvalidUrl(resource));
+        }
+        Ok(url)
+    }
+
+    async fn get(
+        &self,
+        url: Url,
+        accept: &str,
+        token: Option<&reqwest::header::HeaderValue>,
+    ) -> Result<Response, GitHubError> {
+        let mut request = self
+            .http
+            .get(url)
+            .header(reqwest::header::ACCEPT, accept)
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(token) = token {
+            request = request.header(reqwest::header::AUTHORIZATION, token);
+        }
+        request
+            .send()
+            .await
+            .map_err(|error| GitHubError::Transport(error.without_url()))
+    }
+
+    async fn check_status(response: Response) -> Result<Response, GitHubError> {
+        let status = response.status();
+        match status {
+            StatusCode::OK => Ok(response),
+            StatusCode::UNAUTHORIZED => Err(GitHubError::Unauthorized),
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN => {
+                let header = |name| {
+                    response
+                        .headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                };
+                let retry_after_header = header("retry-after");
+                let remaining = header("x-ratelimit-remaining");
+                let retry_after = retry_after_header.and_then(|value| value.parse().ok());
+                let reset_at = (remaining == Some("0"))
+                    .then(|| header("x-ratelimit-reset")?.parse().ok())
+                    .flatten();
+
+                if status == StatusCode::TOO_MANY_REQUESTS
+                    || retry_after_header.is_some()
+                    || remaining == Some("0")
+                {
+                    return Err(GitHubError::RateLimited {
+                        retry_after,
+                        reset_at,
+                    });
+                }
+
+                #[derive(Deserialize)]
+                struct ErrorResponse {
+                    message: String,
+                }
+                if response
+                    .json::<ErrorResponse>()
+                    .await
+                    .is_ok_and(|error| error.message.to_ascii_lowercase().contains("rate limit"))
+                {
+                    Err(GitHubError::RateLimited {
+                        retry_after,
+                        reset_at,
+                    })
+                } else {
+                    Err(GitHubError::Forbidden)
+                }
+            }
+            _ => Err(GitHubError::Http(status)),
+        }
+    }
+
+    fn next_page(
+        response: &Response,
+        current: &Url,
+        endpoint: &Url,
+    ) -> Result<Option<Url>, GitHubError> {
+        let mut next = None;
+        for header in response.headers().get_all(reqwest::header::LINK) {
+            let header = header
+                .to_str()
+                .map_err(|_| GitHubError::InvalidPagination)?;
+            for link in header.split(',') {
+                let (target, attributes) = link
+                    .trim()
+                    .strip_prefix('<')
+                    .and_then(|link| link.split_once('>'))
+                    .ok_or(GitHubError::InvalidPagination)?;
+                let is_next = attributes
+                    .split(';')
+                    .filter_map(|attribute| attribute.split_once('='))
+                    .any(|(name, value)| {
+                        name.trim().eq_ignore_ascii_case("rel")
+                            && value
+                                .trim()
+                                .trim_matches('"')
+                                .split_whitespace()
+                                .any(|relation| relation.eq_ignore_ascii_case("next"))
+                    });
+                if !is_next {
+                    continue;
+                }
+                let url = current
+                    .join(target)
+                    .map_err(|_| GitHubError::InvalidPagination)?;
+                if url.origin() != endpoint.origin()
+                    || url.path() != endpoint.path()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.fragment().is_some()
+                    || next.replace(url).is_some()
+                {
+                    return Err(GitHubError::InvalidPagination);
+                }
+            }
+        }
+        Ok(next)
+    }
+
+    async fn json<T: serde::de::DeserializeOwned>(response: Response) -> Result<T, GitHubError> {
+        response
+            .json()
+            .await
+            .map_err(|error| GitHubError::InvalidResponse(error.without_url()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Store;
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    struct Server(TcpListener);
+
+    impl Server {
+        async fn start() -> Self {
+            Self(TcpListener::bind("127.0.0.1:0").await.unwrap())
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/", self.0.local_addr().unwrap())
+        }
+
+        async fn reply(&self, status: u16, headers: &str, body: &str) -> String {
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), self.0.accept())
+                .await
+                .expect("expected a GitHub API request")
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            let response = format!(
+                "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request
+        }
+    }
+
+    fn repo(id: i64, full_name: &str, private: bool) -> serde_json::Value {
+        json!({
+            "id": id,
+            "full_name": full_name,
+            "html_url": format!("https://github.com/{full_name}"),
+            "private": private,
+        })
+    }
+
+    fn star(id: i64, full_name: &str) -> serde_json::Value {
+        json!({"starred_at": "2025-05-09T10:11:12Z", "repo": repo(id, full_name, false)})
+    }
+
+    #[tokio::test]
+    async fn explicit_search_sends_one_anonymous_public_query_and_returns_github_links() {
+        let server = Server::start().await;
+        let client = GitHub::with_base_url(&server.url(), Some("example-token")).unwrap();
+        let body =
+            json!({"items": [repo(1, "acme/search.rs", false), repo(2, "acme/hidden", true)]})
+                .to_string();
+        let headers = format!(
+            "Link: <{}search/repositories?page=2>; rel=\"next\"\r\n",
+            server.url()
+        );
+        let (result, request) = tokio::join!(
+            client.search_public("中文 search & Rust is:private"),
+            server.reply(200, &headers, &body)
+        );
+
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+        let mut request_line = request.lines().next().unwrap().split_whitespace();
+        assert_eq!(request_line.next(), Some("GET"));
+        let url = Url::parse(&server.url())
+            .unwrap()
+            .join(request_line.next().unwrap())
+            .unwrap();
+        assert_eq!(url.path(), "/search/repositories");
+        assert_eq!(
+            url.query_pairs().find(|(key, _)| key == "q").unwrap().1,
+            "中文 search & Rust is:private is:public"
+        );
+        let candidates = result.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].html_url, "https://github.com/acme/search.rs");
+    }
+
+    #[tokio::test]
+    async fn sync_client_reads_all_starred_pages_with_the_configured_credential() {
+        let server = Server::start().await;
+        let client = GitHub::with_base_url(&server.url(), Some("example-token")).unwrap();
+        let first = json!([{
+            "starred_at": "2025-05-09T10:11:12Z",
+            "repo": repo(10, "acme/first", true),
+        }]);
+        let next = json!([{
+            "starred_at": "2025-05-03T10:11:12Z",
+            "repo": repo(20, "acme/second", false),
+        }]);
+        let (result, ()) = tokio::join!(client.starred(), async {
+            let link = format!(
+                "Link: <{}user/starred?page=8>; rel=\"last\", <{}user/starred?page=2&per_page=100>; rel=\"next\"\r\n",
+                server.url(), server.url(),
+            );
+            let first = server.reply(200, &link, &first.to_string()).await;
+            let next = server.reply(200, "", &next.to_string()).await;
+            assert_eq!(
+                first.lines().next(),
+                Some("GET /user/starred?per_page=100 HTTP/1.1")
+            );
+            assert_eq!(
+                next.lines().next(),
+                Some("GET /user/starred?page=2&per_page=100 HTTP/1.1")
+            );
+            for request in [first, next] {
+                assert!(request.contains("authorization: Bearer example-token"));
+                assert!(request.contains("accept: application/vnd.github.star+json"));
+            }
+        });
+        let repos = result.unwrap();
+        assert_eq!(
+            repos.iter().map(|repo| repo.id).collect::<Vec<_>>(),
+            [10, 20]
+        );
+        assert!(repos[0].private);
+        assert_eq!(repos[1].starred_at.as_deref(), Some("2025-05-03T10:11:12Z"));
+    }
+
+    #[tokio::test]
+    async fn remote_errors_distinguish_bad_credentials_permissions_and_rate_limits() {
+        let server = Server::start().await;
+        let client = GitHub::with_base_url(&server.url(), Some("example-token")).unwrap();
+        for (status, headers, body, message) in [
+            (401, "", "{}", "Check or replace STARCHIVE_GITHUB_TOKEN"),
+            (403, "", "{}", "Check the credential's read permissions"),
+            (403, "Retry-After: 60\r\n", "{}", "Retry after 60 seconds"),
+            (
+                403,
+                "",
+                r#"{"message":"You have exceeded a secondary rate limit."}"#,
+                "Wait before retrying",
+            ),
+            (429, "", "{}", "Wait before retrying"),
+        ] {
+            let (result, _) = tokio::join!(client.starred(), server.reply(status, headers, body));
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(message), "unexpected error: {error}");
+            assert!(!error.contains("example-token"));
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_selected_readme_as_text_and_handles_absence() {
+        let server = Server::start().await;
+        let client = GitHub::with_base_url(&server.url(), Some("example-token")).unwrap();
+        let readme = json!({
+            "encoding": "base64",
+            "content": "IyDkuK3mlocK\n",
+            "html_url": "https://github.com/acme/search.rs/blob/main/docs/README.md",
+        })
+        .to_string();
+        let (result, request) = tokio::join!(client.readme(1), server.reply(200, "", &readme),);
+        assert_eq!(
+            request.lines().next(),
+            Some("GET /repositories/1/readme HTTP/1.1")
+        );
+        assert!(!request.contains("authorization:"));
+        assert_eq!(result.unwrap().as_deref(), Some("# 中文\n"));
+
+        let (result, _) = tokio::join!(client.readme(2), server.reply(404, "", "{}"),);
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn rejects_repository_links_outside_github() {
+        let server = Server::start().await;
+        let client = GitHub::with_base_url(&server.url(), None).unwrap();
+        let mut invalid = repo(1, "acme/lookup", false);
+        invalid["html_url"] = json!("https://github.com.example.org/acme/lookup");
+        let body = json!({"items": [invalid]}).to_string();
+        let (result, _) =
+            tokio::join!(client.search_public("lookup"), server.reply(200, "", &body));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid repository URL"));
+    }
+
+    #[tokio::test]
+    async fn failed_pagination_preserves_the_library_and_retry_applies_the_whole_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("library.sqlite"))
+            .await
+            .unwrap();
+        let server = Server::start().await;
+        let client = GitHub::with_base_url(&server.url(), Some("example-token")).unwrap();
+        let original = json!([star(1, "acme/old-name"), star(2, "acme/retired")]).to_string();
+        let (result, _) = tokio::join!(client.sync(&store), server.reply(200, "", &original));
+        assert_eq!(result.unwrap().starred, 2);
+        let tags = [String::from("搜索")];
+        store
+            .edit_repository(1, Some("Works offline"), Some(&tags))
+            .await
+            .unwrap();
+        let last_successful = store
+            .sync_status()
+            .await
+            .unwrap()
+            .last_successful_at
+            .unwrap();
+        let rename = json!([star(1, "acme/new-name")]).to_string();
+        let more = "Link: <?page=2>; rel=\"next\"\r\n";
+
+        let (result, ()) = tokio::join!(client.sync(&store), async {
+            server.reply(200, more, &rename).await;
+            server.reply(502, "", "{}").await;
+        });
+        assert!(result.unwrap_err().to_string().contains("502"));
+        let status = store.sync_status().await.unwrap();
+        assert_eq!(
+            status.last_successful_at.as_deref(),
+            Some(last_successful.as_str())
+        );
+        assert_eq!(status.last_result.unwrap().starred, 2);
+        assert!(status.last_error.unwrap().contains("502"));
+        assert_eq!(
+            store
+                .get_repository(1)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata
+                .full_name,
+            "acme/old-name"
+        );
+        assert!(store.get_repository(2).await.unwrap().unwrap().starred);
+
+        let (result, ()) = tokio::join!(client.sync(&store), async {
+            server.reply(200, more, &rename).await;
+            server
+                .reply(200, "", &json!([star(3, "acme/new-star")]).to_string())
+                .await;
+        });
+        let summary = result.unwrap();
+        assert_eq!(
+            (summary.starred, summary.newly_starred, summary.unstarred),
+            (2, 1, 1)
+        );
+        assert!(store.sync_status().await.unwrap().last_error.is_none());
+        let renamed = store.get_repository(1).await.unwrap().unwrap();
+        assert_eq!(renamed.metadata.full_name, "acme/new-name");
+        assert_eq!(renamed.note, "Works offline");
+        assert_eq!(renamed.tags, tags);
+        assert!(!store.get_repository(2).await.unwrap().unwrap().starred);
+        assert!(store.get_repository(3).await.unwrap().unwrap().starred);
+    }
+
+    #[tokio::test]
+    async fn caches_the_selected_repositorys_readme_and_keeps_it_after_a_failed_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("library.sqlite"))
+            .await
+            .unwrap();
+        let server = Server::start().await;
+        let client = GitHub::with_base_url(&server.url(), Some("example-token")).unwrap();
+        let stars = json!([star(1, "acme/selected")]).to_string();
+        let (result, _) = tokio::join!(client.sync(&store), server.reply(200, "", &stars));
+        result.unwrap();
+        let metadata = store.get_repository(1).await.unwrap().unwrap().metadata;
+
+        let source = "https://github.com/acme/selected/blob/trunk/README.md";
+        let body = json!({"encoding": "base64", "content": "IyBMb29rdXAK", "html_url": source})
+            .to_string();
+        let (result, request) = tokio::join!(
+            client.refresh_readme(&store, &metadata),
+            server.reply(200, "", &body)
+        );
+        assert!(!request.contains("authorization:"));
+        let readme = result.unwrap().unwrap();
+        assert_eq!(readme.source_url, source);
+        assert_eq!(readme.content, "# Lookup\n");
+
+        let (result, _) = tokio::join!(
+            client.refresh_readme(&store, &metadata),
+            server.reply(403, "", "{}")
+        );
+        assert!(result.is_err());
+        assert_eq!(store.get_readme(1).await.unwrap(), Some(readme));
+    }
+
+    #[tokio::test]
+    async fn explicitly_selected_private_repository_uses_authenticated_readme_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("library.sqlite"))
+            .await
+            .unwrap();
+        let server = Server::start().await;
+        let client = GitHub::with_base_url(&server.url(), Some("example-token")).unwrap();
+        let stars = json!([{
+            "starred_at": "2025-05-09T10:11:12Z",
+            "repo": repo(1, "acme/selected", true),
+        }])
+        .to_string();
+        let (result, _) = tokio::join!(client.sync(&store), server.reply(200, "", &stars));
+        result.unwrap();
+        let metadata = store.get_repository(1).await.unwrap().unwrap().metadata;
+        let body = json!({
+            "encoding": "base64",
+            "content": "IyBMb29rdXAK",
+            "html_url": "https://github.com/new-owner/renamed/blob/trunk/README.md",
+        })
+        .to_string();
+        let (result, request) = tokio::join!(
+            client.refresh_readme(&store, &metadata),
+            server.reply(200, "", &body),
+        );
+        assert_eq!(
+            request.lines().next(),
+            Some("GET /repositories/1/readme HTTP/1.1")
+        );
+        assert!(request.contains("authorization: Bearer example-token"));
+        assert_eq!(result.unwrap().unwrap().content, "# Lookup\n");
+    }
+
+    #[tokio::test]
+    async fn competing_sync_is_rejected_while_the_first_sync_waits_for_a_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("library.sqlite");
+        let store = Store::open(&path).await.unwrap();
+        let other_entry_point = Store::open(&path).await.unwrap();
+        let server = Server::start().await;
+        let client = GitHub::with_base_url(&server.url(), Some("example-token")).unwrap();
+        let (result, ()) = tokio::join!(client.sync(&store), async {
+            server
+                .reply(200, "Link: <?page=2>; rel=\"next\"\r\n", "[]")
+                .await;
+            assert!(other_entry_point.sync_status().await.unwrap().in_progress);
+            let duplicate =
+                tokio::time::timeout(Duration::from_secs(2), client.sync(&other_entry_point))
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+            assert!(duplicate.to_string().contains("already in progress"));
+            assert!(other_entry_point
+                .list_repositories(&Default::default())
+                .await
+                .unwrap()
+                .is_empty());
+            let final_page = json!([star(1, "acme/only")]).to_string();
+            let request = server.reply(200, "", &final_page).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("GET /user/starred?page=2 HTTP/1.1")
+            );
+        });
+        assert_eq!(result.unwrap().starred, 1);
+        assert!(!other_entry_point.sync_status().await.unwrap().in_progress);
+        assert_eq!(
+            other_entry_point
+                .list_repositories(&Default::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_pagination_does_not_follow_cross_origin_links() {
+        let server = Server::start().await;
+        let other_server = Server::start().await;
+        let client = GitHub::with_base_url(&server.url(), Some("example-token")).unwrap();
+        let link = format!(
+            "Link: <{}user/starred?page=2>; rel=\"next\"\r\n",
+            other_server.url()
+        );
+        let (result, _) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(client.starred(), server.reply(200, &link, "[]"))
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(GitHubError::InvalidPagination)));
+    }
+}

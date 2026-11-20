@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Starchive",
+  "version": "0.1.0",
+  "identifier": "io.starchive.app",
+  "build": {
+    "beforeDevCommand": { "script": "npm run dev", "cwd": "../frontend" },
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": { "script": "npm run build", "cwd": "../frontend" },
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [{ "title": "Starchive", "width": 1440, "height": 900, "minWidth": 720, "minHeight": 540 }],
+    "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"]
+  }
+}
