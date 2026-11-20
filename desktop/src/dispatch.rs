@@ -14,7 +14,7 @@ use starchive_core::{
 mod view;
 
 #[derive(Clone, Copy)]
-struct Id(i64);
+pub(super) struct Id(i64);
 
 impl<'de> Deserialize<'de> for Id {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -276,27 +276,8 @@ impl Desktop {
                 self.session_view(sessions.remove_context(session_id, repo_id).await?)
                     .await
             }
-            Action::AgentSend {
-                session_id: Id(id),
-                text,
-            } => {
-                let session = sessions.get(id).await?;
-                check_agent(
-                    session
-                        .agent_id
-                        .as_deref()
-                        .context("Choose a local agent first")?,
-                )?;
-                let executable = current_pi_path()
-                    .await?
-                    .context("Install pi or set its executable path in Settings")?;
-                let library = AgentLibrary::load(store).await?;
-                self.session_view(
-                    sessions
-                        .ask(id, &text, &library, &PiAgent::new(executable))
-                        .await?,
-                )
-                .await
+            Action::AgentSend { session_id, text } => {
+                self.send_agent(session_id, &text, None).await
             }
             Action::AgentExpand {
                 session_id: Id(id),
@@ -316,6 +297,34 @@ impl Desktop {
                 Ok(Value::Null)
             }
         }
+    }
+
+    pub(super) async fn send_agent(
+        &self,
+        Id(id): Id,
+        text: &str,
+        channel: Option<tauri::ipc::Channel<String>>,
+    ) -> Result<Value> {
+        let session = self.conversations.get(id).await?;
+        check_agent(
+            session
+                .agent_id
+                .as_deref()
+                .context("Choose a local agent first")?,
+        )?;
+        let executable = current_pi_path()
+            .await?
+            .context("Install pi or set its executable path in Settings")?;
+        let mut agent = PiAgent::new(executable);
+        if let Some(channel) = channel {
+            agent = agent.with_text_delta(move |delta| {
+                // Closing the view need not interrupt saving a valid response to this session.
+                let _ = channel.send(delta);
+            });
+        }
+        let library = AgentLibrary::load(&self.store).await?;
+        self.session_view(self.conversations.ask(id, text, &library, &agent).await?)
+            .await
     }
 
     async fn session_view(&self, session: Session) -> Result<Value> {
