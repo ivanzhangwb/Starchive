@@ -22,7 +22,12 @@ fn cli(db: &Path, args: &[&str]) -> Result<Value> {
 #[cfg(unix)]
 #[tokio::test]
 async fn malformed_credentials_record_a_failed_sync_and_preserve_the_last_success() -> Result<()> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
     let dir = tempfile::tempdir()?;
+    let gh = dir.path().join("gh");
+    fs::write(&gh, "#!/bin/sh\n: > \"$0.invoked\"\nexit 1\n")?;
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o700))?;
     let db = dir.path().join("library.sqlite3");
     let store = Store::open(&db).await?;
     store
@@ -39,6 +44,7 @@ async fn malformed_credentials_record_a_failed_sync_and_preserve_the_last_succes
         .arg("sync")
         .env("HOME", dir.path())
         .env("XDG_CONFIG_HOME", dir.path())
+        .env("PATH", dir.path())
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env("STARCHIVE_GITHUB_TOKEN", "malformed credential sentinel")
@@ -48,10 +54,10 @@ async fn malformed_credentials_record_a_failed_sync_and_preserve_the_last_succes
     let after = cli(&db, &["status"])?;
     assert_eq!(after["last_successful_at"], before["last_successful_at"]);
     assert_eq!(after["in_progress"], false);
-    assert!(after["last_error"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("invalid characters"));
+    let error = after["last_error"].as_str().unwrap_or_default();
+    assert!(error.contains("credential"), "{error}");
+    assert!(!error.contains("sentinel"));
+    assert!(!dir.path().join("gh.invoked").exists());
     Ok(())
 }
 
