@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
 
 export interface Repo {
   id: string
@@ -116,6 +116,16 @@ type Dispatch = {
 
 export function dispatch<Action extends keyof Dispatch>(action: Action, payload: Dispatch[Action][0]) {
   return invoke<Dispatch[Action][1]>('dispatch', { action, payload })
+}
+
+export async function streamAgentTurn(sessionId: string, text: string, onText: (delta: string) => void) {
+  const onDelta = new Channel<string>(onText)
+  try {
+    return await invoke<Session>('agent_send_stream', { sessionId, text, onDelta })
+  } finally {
+    // Tauri releases the channel callback when the Rust channel closes.
+    onDelta.onmessage = () => {}
+  }
 }
 
 export function errorMessage(error: unknown) {

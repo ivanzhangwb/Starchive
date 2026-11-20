@@ -1,10 +1,11 @@
 import { ArrowRight, BookMarked, ChevronRight, Github, MessageSquare, Plus, Send, Settings2, X } from 'lucide-react'
-import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { dispatch, errorMessage, formatTime, type Agent, type Candidate, type ContextRepo, type Repo, type Session, type SessionMessage, type SessionSummary } from './api'
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react'
+import { dispatch, errorMessage, formatTime, type Agent, type Candidate, type ContextRepo, type Repo, type SessionMessage } from './api'
 import type { RepoSelection } from './RepoDetails'
 import { Dialog, Loading, Markdown, Notice, RepoState } from './ui'
+import { useChatSession } from './useChatSession'
 
-const activeSessionKey = 'starchive.active-session'
+const bottomThreshold = 48
 const evidenceLabels: Record<string, string> = {
   description: '仓库描述',
   readme: 'README',
@@ -12,17 +13,6 @@ const evidenceLabels: Record<string, string> = {
   repository_name: '仓库名称',
   language: '语言',
   topics: '主题',
-}
-
-type Operation = 'session' | 'agent' | 'context' | 'turn' | 'search'
-
-function rememberSession(id?: string) {
-  try {
-    if (id) localStorage.setItem(activeSessionKey, id)
-    return localStorage.getItem(activeSessionKey)
-  } catch {
-    return null
-  }
 }
 
 export function AgentPane({ contextRepo, syncTimestamp, agentRevision, onContext, onCloseContext, onSelectRepo, onBusy, onSessionChange, onOpenSettings }: {
@@ -36,196 +26,145 @@ export function AgentPane({ contextRepo, syncTimestamp, agentRevision, onContext
   onSessionChange: (id: string | null) => void
   onOpenSettings: () => void
 }) {
-  const [agents, setAgents] = useState<Agent[] | null>(null)
-  const [sessions, setSessions] = useState<SessionSummary[]>([])
-  const [session, setSession] = useState<Session | null>(null)
+  const [availability, setAvailability] = useState<{ revision: number; agents?: Agent[]; error?: string } | null>(null)
   const [preferredAgent, setPreferredAgent] = useState('')
-  const [loading, setLoading] = useState(true)
-  const [retry, setRetry] = useState(0)
-  const [loadError, setLoadError] = useState('')
-  const [agentsError, setAgentsError] = useState('')
-  const [busy, setBusy] = useState<Operation | null>(null)
-  const [failure, setFailure] = useState<{ operation: Operation; message: string } | null>(null)
-  const [drafts, setDrafts] = useState<Record<string, string>>({})
-  const [searchTerms, setSearchTerms] = useState('')
-  const [searchOpen, setSearchOpen] = useState(false)
+  const [search, setSearch] = useState<{ key: string; terms: string } | null>(null)
+  const chat = useChatSession(preferredAgent, syncTimestamp)
+  const { key, session, busy, turn, draft, failure } = chat
+  const searchDialog = search?.key === key ? search : null
+  const searchFailure = failure?.operation === 'search' ? failure.message : undefined
+  const contextFailure = contextRepo && failure?.operation === 'context' && failure.repoId === contextRepo.id
+    ? failure.message : undefined
   const history = useRef<HTMLDivElement>(null)
-  const currentId = useRef<string | null>(null)
-  const operationPending = useRef(false)
-  const refreshedTimestamp = useRef<string | null>(null)
-  const draftKey = session?.id ?? ''
-  const draft = drafts[draftKey] ?? ''
-  const agentId = session?.agent_id ?? (!session ? preferredAgent : '')
+  const composer = useRef<HTMLTextAreaElement>(null)
+  const composing = useRef(false)
+  const positions = useRef(new Map<string, { top: number; follow: boolean }>())
+  const previousKey = useRef(key)
+  const currentContext = useRef(contextRepo)
+  const agentsLoading = availability?.revision !== agentRevision
+  const agents = availability?.agents
+  const agentId = session ? session.agent_id ?? '' : preferredAgent
   const selectedAgent = agents?.find((agent) => agent.id === agentId)
-  const locked = loading || (agents === null && !agentsError) || busy !== null
-
-  function acceptSession(next: Session) {
-    currentId.current = next.id
-    rememberSession(next.id)
-    setSession(next)
-    setSessions((current) => [
-      { id: next.id, title: next.title, updated_at: next.updated_at },
-      ...current.filter((item) => item.id !== next.id),
-    ].sort((a, b) => b.updated_at.localeCompare(a.updated_at)))
-  }
+  const locked = chat.restoring || chat.missingSession || agentsLoading || busy !== null
+  const canSend = !locked && selectedAgent?.available
+  const loadingHistory = chat.restoring || chat.loadingSession
+  const searching = busy === 'search'
 
   useEffect(() => {
     let active = true
     void dispatch('agent_list', {}).then((available) => {
       if (!active) return
-      setAgents(available)
-      setAgentsError('')
-      setPreferredAgent((current) => current || available.find((agent) => agent.available)?.id || '')
+      setAvailability({ revision: agentRevision, agents: available })
+      setPreferredAgent((current) => available.some((agent) => agent.id === current && agent.available)
+        ? current : available.find((agent) => agent.available)?.id ?? '')
     }).catch((error: unknown) => {
-      if (active) setAgentsError(errorMessage(error))
+      if (active) setAvailability({ revision: agentRevision, error: errorMessage(error) })
     })
     return () => { active = false }
-  }, [agentRevision, retry])
-
-  useEffect(() => {
-    let active = true
-    setLoading(true)
-    setLoadError('')
-    void dispatch('session_list', {}).then(async (saved) => {
-      if (!active) return
-      setSessions(saved)
-      const target = saved.find((item) => item.id === rememberSession()) ?? saved[0]
-      if (target) {
-        const restored = await dispatch('session_get', { session_id: target.id })
-        if (active) acceptSession(restored)
-      }
-    }).catch((error: unknown) => {
-      if (active) setLoadError(errorMessage(error))
-    }).finally(() => {
-      if (active) setLoading(false)
-    })
-    return () => { active = false }
-  }, [retry])
+  }, [agentRevision])
 
   useEffect(() => { onBusy(locked) }, [locked, onBusy])
   useEffect(() => { onSessionChange(session?.id ?? null) }, [session?.id, onSessionChange])
+  useLayoutEffect(() => { currentContext.current = contextRepo }, [contextRepo])
 
-  useEffect(() => {
-    if (!session || !syncTimestamp || locked || refreshedTimestamp.current === syncTimestamp) return
-    let active = true
-    void dispatch('session_get', { session_id: session.id }).then((updated) => {
-      if (active) {
-        refreshedTimestamp.current = syncTimestamp
-        acceptSession(updated)
-      }
-    }).catch(() => {
-      // The open conversation remains readable during a background refresh failure.
-    })
-    return () => { active = false }
-  }, [locked, session?.id, syncTimestamp])
-
-  useEffect(() => {
-    if (history.current) history.current.scrollTop = history.current.scrollHeight
-  }, [session?.id, session?.messages.length, busy])
-
-  async function ensureSession() {
-    if (session) return session
-    const next = await dispatch('session_create', { agent_id: agentId || null })
-    if (draft) setDrafts((current) => ({ ...current, '': '', [next.id]: draft }))
-    acceptSession(next)
-    return next
-  }
-
-  async function run(operation: Operation, execute: () => Promise<Session>) {
-    if (locked || operationPending.current) return null
-    operationPending.current = true
-    setBusy(operation)
-    setFailure(null)
-    try {
-      const next = await execute()
-      acceptSession(next)
-      return next
-    } catch (error) {
-      setFailure({ operation, message: errorMessage(error) })
-      if (operation !== 'session' && currentId.current) {
-        try {
-          acceptSession(await dispatch('session_get', { session_id: currentId.current }))
-        } catch {
-          // Keep the last readable snapshot when a recovery read also fails.
-        }
-      }
-      return null
-    } finally {
-      operationPending.current = false
-      setBusy(null)
+  useLayoutEffect(() => {
+    const view = history.current
+    const position = positions.current.get(key)
+    if (view) {
+      if (position?.follow !== false) view.scrollTop = view.scrollHeight
+      else if (previousKey.current !== key) view.scrollTop = position.top
     }
+    if (previousKey.current !== key) composing.current = false
+    previousKey.current = key
+  }, [key, session?.messages, turn, searching, loadingHistory])
+
+  useEffect(() => {
+    const view = history.current
+    if (!view) return
+    const observer = new ResizeObserver(() => {
+      if (view.clientHeight && positions.current.get(key)?.follow !== false) view.scrollTop = view.scrollHeight
+    })
+    observer.observe(view)
+    return () => observer.disconnect()
+  }, [key])
+
+  function followLatest() {
+    positions.current.delete(key)
+    composer.current?.focus({ preventScroll: true })
   }
 
-  async function send(event: FormEvent<HTMLFormElement>) {
+  function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    const text = draft.trim()
-    if (!text || !selectedAgent?.available) return
-    const next = await run('turn', async () => {
-      const active = await ensureSession()
-      return dispatch('agent_send', { session_id: active.id, text })
-    })
-    if (next) setDrafts((current) => ({ ...current, [next.id]: '' }))
+    if (canSend && !composing.current) void chat.send(false, followLatest)
+  }
+
+  function composeKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== 'Enter' || event.shiftKey) return
+    if (composing.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
+    event.preventDefault()
+    if (!event.repeat) event.currentTarget.form?.requestSubmit()
   }
 
   async function expand(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    const publicQuery = searchTerms.trim()
-    if (!session?.can_expand || !publicQuery) return
-    if (await run('search', () => dispatch('agent_expand', { session_id: session.id, public_query: publicQuery }))) {
-      setSearchOpen(false)
-      setSearchTerms('')
+    const publicQuery = searchDialog?.terms.trim()
+    if (locked || !session?.can_expand || !publicQuery) return
+    if (await chat.mutate('search', (active) => dispatch('agent_expand', { session_id: active.id, public_query: publicQuery }))) {
+      setSearch((current) => current === searchDialog ? null : current)
     }
   }
 
+  function closeSearch() {
+    chat.clearFailure('search')
+    setSearch(null)
+  }
+
   function closeContext() {
-    setFailure((current) => current?.operation === 'context' ? null : current)
+    if (contextRepo) chat.clearFailure('context', contextRepo.id)
     onCloseContext()
   }
 
   async function saveContext(repo: Repo, permissions: Pick<ContextRepo, 'include_private' | 'include_notes'>) {
-    if (await run('context', async () => {
-      const active = await ensureSession()
-      return dispatch('session_set_context', { session_id: active.id, repo_id: repo.id, ...permissions })
-    })) closeContext()
+    if (locked) return
+    if (await chat.mutate('context', (active) => dispatch('session_set_context', { session_id: active.id, repo_id: repo.id, ...permissions }), repo.id)
+      && currentContext.current === repo) closeContext()
   }
 
-  function showCandidate(repo: Repo) {
-    if (session) onSelectRepo({ id: repo.id, fallback: repo, sessionId: session.id })
-  }
+  const sessionId = session?.id
+  const showCandidate = useCallback((repo: Repo) => {
+    if (sessionId) onSelectRepo({ id: repo.id, fallback: repo, sessionId })
+  }, [sessionId, onSelectRepo])
 
-  const retryLoad = () => setRetry((value) => value + 1)
+  const selectedSession = sessionId ?? key
   const existingContext = session?.context.find((item) => item.repo.id === contextRepo?.id)
-  const visibleFailure = failure && !(failure.operation === 'context' && contextRepo) && !(failure.operation === 'search' && searchOpen)
-  const agentUnavailable = !loading && agents && !agents.some((agent) => agent.available)
-  const agentIssue = agentsError || (agentUnavailable
+  const visibleFailure = failure && failure.operation !== 'load' && !contextFailure && !(searchDialog && searchFailure)
+  const agentUnavailable = agents && !agents.some((agent) => agent.available)
+  const agentIssue = agentsLoading ? '' : availability?.error || (agentUnavailable
     ? '未找到可用的本地 Agent。请在设置中检测或指定 pi 的路径。'
-    : !loading && agents && agentId && !selectedAgent?.available ? '当前 Agent 不可用。请检查设置或选择已安装的 Agent。' : '')
+    : agents && agentId && !selectedAgent?.available ? '当前 Agent 不可用。请检查设置或选择已安装的 Agent。' : '')
 
   return (
     <aside className="agent-pane" id="agent" aria-label="Agent 会话">
       <header className="agent-header">
         <div className="section-heading">
           <h2><MessageSquare size={19} /> Agent 会话</h2>
-          <button type="button" className="button small" disabled={locked} onClick={() => void run('session', () => dispatch('session_create', { agent_id: agentId || null }))}>
+          <button type="button" className="button small" disabled={chat.restoring || agentsLoading || busy === 'create'} onClick={() => void chat.create(agentId || preferredAgent)}>
             <Plus size={15} /> 新建会话
           </button>
         </div>
         <div className="agent-controls">
           <label>
             <span>历史会话</span>
-            <select value={session?.id ?? ''} disabled={locked || !sessions.length} onChange={(event) => {
-              const id = event.target.value
-              if (id) void run('session', () => dispatch('session_get', { session_id: id }))
-            }}>
-              <option value="" disabled>{sessions.length ? '选择会话' : '暂无会话'}</option>
-              {sessions.map((item) => <option value={item.id} key={item.id}>{item.title} · {formatTime(item.updated_at)}</option>)}
+            <select value={selectedSession} disabled={chat.restoring || !chat.options.length} onChange={(event) => void chat.select(event.currentTarget.value)}>
+              {!chat.options.some((item) => item.id === selectedSession) && <option value={selectedSession} disabled>{chat.options.length ? '选择会话' : '暂无会话'}</option>}
+              {chat.options.map((item) => <option value={item.id} key={item.id}>{item.title}{item.updated_at && ` · ${formatTime(item.updated_at)}`}</option>)}
             </select>
           </label>
           <label>
             <span>本地 Agent</span>
             <select value={agentId} disabled={locked} onChange={(event) => {
               const id = event.target.value
-              if (session) void run('agent', () => dispatch('session_set_agent', { session_id: session.id, agent_id: id }))
+              if (session) void chat.mutate('agent', (active) => dispatch('session_set_agent', { session_id: active.id, agent_id: id }))
               else setPreferredAgent(id)
             }}>
               <option value="" disabled>选择 Agent</option>
@@ -235,7 +174,8 @@ export function AgentPane({ contextRepo, syncTimestamp, agentRevision, onContext
           </label>
         </div>
         <p className="agent-disclosure">本地 Agent 的模型推理可能联网。</p>
-        {loadError && <Notice retry={retryLoad}>{loadError}</Notice>}
+        {chat.restoreError && <Notice retry={chat.retryRestore}>{chat.restoreError}</Notice>}
+        {failure?.operation === 'load' && <Notice retry={() => void chat.select(selectedSession)}>{failure.message}</Notice>}
       </header>
       <section className="context-bar" aria-label="对话上下文">
         <div className="context-heading"><BookMarked size={15} /><h3>对话上下文</h3></div>
@@ -248,7 +188,7 @@ export function AgentPane({ contextRepo, syncTimestamp, agentRevision, onContext
                   {include_private && <small>私有</small>}
                   {include_notes && <small>笔记</small>}
                 </button>
-                <button type="button" disabled={locked} aria-label={`移除 ${repo.full_name}`} onClick={() => void run('context', () => dispatch('session_remove_context', { session_id: session.id, repo_id: repo.id }))}>
+                <button type="button" disabled={locked} aria-label={`移除 ${repo.full_name}`} onClick={() => void chat.mutate('context', (active) => dispatch('session_remove_context', { session_id: active.id, repo_id: repo.id }))}>
                   <X size={14} />
                 </button>
               </li>
@@ -256,17 +196,35 @@ export function AgentPane({ contextRepo, syncTimestamp, agentRevision, onContext
           </ul>
         ) : <span className="muted">从仓库详情添加比较对象</span>}
       </section>
-      <div className="agent-history" ref={history} role="log" aria-label="会话消息" aria-live="polite">
-        {loading ? <Loading label="正在恢复对话…" /> : session?.messages.length ? (
-          session.messages.map((message) => <Message key={message.id} message={message} onSelectRepo={showCandidate} />)
-        ) : (
+      <div className="agent-history" ref={history} role="log" aria-label="会话消息" aria-relevant="additions" onScroll={(event) => {
+        const { scrollTop, scrollHeight, clientHeight } = event.currentTarget
+        if (clientHeight) positions.current.set(key, { top: scrollTop, follow: scrollHeight - clientHeight - scrollTop <= bottomThreshold })
+      }}>
+        {loadingHistory && <Loading label="正在恢复对话…" />}
+        {session?.messages.map((message) => <Message key={`${key}:${message.id}`} message={message} onSelectRepo={showCandidate} />)}
+        {!loadingHistory && !chat.missingSession && !session?.messages.length && !turn && (
           <div className="agent-empty">
             <span className="empty-icon"><MessageSquare size={23} /></span>
             <h3>从星标库找候选</h3>
             <p>描述你想实现的效果，比如为桌面应用增加中文离线搜索。</p>
           </div>
         )}
-        {(busy === 'turn' || busy === 'search') && <p className="working" role="status">{busy === 'turn' ? 'Agent 正在分析…' : '正在搜索 GitHub…'}</p>}
+        {turn && (
+          <ChatMessage key={`${key}:submitted`} role="user" variant={turn.status === 'failed' ? 'chat-failed' : undefined}>
+            <p className="user-text">{turn.text}</p>
+            {turn.status === 'failed' && <div className="chat-error">
+              <p role="alert">发送失败。{turn.error}</p>
+              <button type="button" className="button small" disabled={!canSend} onClick={() => void chat.send(true, followLatest)}>重试</button>
+              <button type="button" className="text-button" disabled={locked} onClick={chat.discardTurn}>放弃重试</button>
+            </div>}
+          </ChatMessage>
+        )}
+        {turn?.status === 'pending' && (
+          <ChatMessage key={`${key}:pending`} role="assistant" variant="chat-pending">
+            {turn.reply ? <p className="chat-stream">{turn.reply}</p> : <p className="chat-status">正在生成回复…</p>}
+          </ChatMessage>
+        )}
+        {searching && <p className="working" role="status">正在搜索 GitHub…</p>}
       </div>
       <div className="agent-footer">
         {visibleFailure && <Notice>{failure.message}</Notice>}
@@ -277,38 +235,50 @@ export function AgentPane({ contextRepo, syncTimestamp, agentRevision, onContext
           </div>
         )}
         {session?.can_expand && (
-          <button type="button" className="button expand-button" disabled={locked} onClick={() => { setFailure(null); setSearchTerms(''); setSearchOpen(true) }}>
+          <button type="button" className="button expand-button" disabled={locked} onClick={() => { chat.clearFailure('search'); setSearch({ key, terms: '' }) }}>
             <Github size={16} /> 扩展到 GitHub 搜索 <ArrowRight size={15} />
           </button>
         )}
-        <form className="composer" onSubmit={(event) => void send(event)}>
+        <form className="composer" onSubmit={submit}>
           <label htmlFor="agent-message" className="sr-only">对话消息</label>
-          <textarea id="agent-message" rows={2} value={draft} disabled={locked} placeholder="描述需求，或继续比较候选…" onChange={(event) => setDrafts((current) => ({ ...current, [draftKey]: event.target.value }))} />
-          <button type="submit" className="button primary send-button" disabled={locked || !draft.trim() || !selectedAgent?.available}>
+          <textarea
+            key={key}
+            id="agent-message"
+            ref={composer}
+            rows={2}
+            value={draft}
+            disabled={loadingHistory || chat.missingSession}
+            placeholder="描述需求，或继续比较候选…"
+            onChange={(event) => chat.setDraft(event.currentTarget.value)}
+            onCompositionStart={() => { composing.current = true }}
+            onCompositionEnd={() => { composing.current = false }}
+            onKeyDown={composeKeyDown}
+          />
+          <button type="submit" className="button primary send-button" disabled={!canSend || !!turn || !draft.trim()}>
             <Send size={15} /> 发送
           </button>
         </form>
       </div>
       {contextRepo && (
         <ContextDialog
-          key={contextRepo.id}
+          key={`${key}:${contextRepo.id}`}
           repo={contextRepo}
           existing={existingContext}
           busy={locked}
-          error={failure?.operation === 'context' ? failure.message : undefined}
+          error={contextFailure}
           onClose={closeContext}
           onSave={saveContext}
         />
       )}
-      {searchOpen && (
-        <Dialog title="扩展到 GitHub 搜索" busy={locked} onClose={() => { setSearchOpen(false); setFailure(null) }}>
+      {searchDialog && (
+        <Dialog title="扩展到 GitHub 搜索" busy={locked} onClose={closeSearch}>
           <form className="dialog-form" onSubmit={(event) => void expand(event)}>
             <p>输入与当前需求相关的公开关键词。确认后，GitHub 将收到这些关键词并执行一次搜索。</p>
-            <label>公开搜索词<input autoFocus value={searchTerms} disabled={locked} onChange={(event) => setSearchTerms(event.target.value)} required /></label>
-            {failure?.operation === 'search' && <Notice>{failure.message}</Notice>}
+            <label>公开搜索词<input autoFocus value={searchDialog.terms} disabled={locked} onChange={(event) => setSearch({ key, terms: event.currentTarget.value })} required /></label>
+            {searchFailure && <Notice>{searchFailure}</Notice>}
             <div className="button-row">
-              <button className="button primary" disabled={locked || !searchTerms.trim()}><Github size={16} /> {busy === 'search' ? '正在搜索…' : '搜索一次'}</button>
-              <button className="button" type="button" disabled={locked} onClick={() => { setSearchOpen(false); setFailure(null) }}>取消</button>
+              <button className="button primary" disabled={locked || !searchDialog.terms.trim()}><Github size={16} /> {searching ? '正在搜索…' : '搜索一次'}</button>
+              <button className="button" type="button" disabled={locked} onClick={closeSearch}>取消</button>
             </div>
           </form>
         </Dialog>
@@ -317,18 +287,26 @@ export function AgentPane({ contextRepo, syncTimestamp, agentRevision, onContext
   )
 }
 
-function Message({ message, onSelectRepo }: { message: SessionMessage; onSelectRepo: (repo: Repo) => void }) {
+function ChatMessage({ role, variant, children }: { role: SessionMessage['role']; variant?: 'chat-pending' | 'chat-failed'; children: ReactNode }) {
   return (
-    <article className={`message message-${message.role}`}>
-      <h3>{message.role === 'user' ? '你' : 'Agent'}</h3>
+    <article className={`chat-message chat-${role}${variant ? ` ${variant}` : ''}`} aria-live={variant === 'chat-pending' ? 'off' : undefined}>
+      <h3 className="chat-author">{role === 'user' ? '你' : 'AI 助手'}</h3>
+      <div className="chat-bubble">{children}</div>
+    </article>
+  )
+}
+
+const Message = memo(function Message({ message, onSelectRepo }: { message: SessionMessage; onSelectRepo: (repo: Repo) => void }) {
+  return (
+    <ChatMessage role={message.role}>
       {message.text && (message.role === 'user' ? <p className="user-text">{message.text}</p> : <Markdown>{message.text}</Markdown>)}
       {!!message.candidates.length && <ul className="candidates">
         {message.candidates.map((candidate) => <CandidateCard key={candidate.repo.id} candidate={candidate} onSelect={() => onSelectRepo(candidate.repo)} />)}
       </ul>}
       <Gaps gaps={message.gaps} />
-    </article>
+    </ChatMessage>
   )
-}
+})
 
 function CandidateCard({ candidate, onSelect }: { candidate: Candidate; onSelect: () => void }) {
   const { repo, fit, evidence, gaps } = candidate
