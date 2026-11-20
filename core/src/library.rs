@@ -88,7 +88,17 @@ pub struct Store {
 #[must_use = "hold the lease until pagination and snapshot recording finish"]
 pub struct SyncLease {
     pool: SqlitePool,
-    _lock: File,
+    _lock: FileLock,
+}
+
+#[derive(Debug)]
+struct FileLock(File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // A concurrent subprocess spawn may temporarily retain the open file.
+        let _ = self.0.unlock();
+    }
 }
 
 impl Store {
@@ -112,7 +122,7 @@ impl Store {
                 .with_context(|| format!("Open migration lock {}", init_path.display()))?;
             lock.lock()
                 .with_context(|| format!("Acquire migration lock {}", init_path.display()))?;
-            Ok((path, lock))
+            Ok((path, FileLock(lock)))
         })
         .await??;
 
@@ -418,13 +428,13 @@ fn open_local_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-async fn try_lock(path: &Path) -> Result<Option<File>> {
+async fn try_lock(path: &Path) -> Result<Option<FileLock>> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let lock =
             open_local_file(&path).with_context(|| format!("Open sync lock {}", path.display()))?;
         match lock.try_lock() {
-            Ok(()) => Ok(Some(lock)),
+            Ok(()) => Ok(Some(FileLock(lock))),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => {
                 Err(error).with_context(|| format!("Acquire sync lock {}", path.display()))
