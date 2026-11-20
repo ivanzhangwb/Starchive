@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{settings, Readme, RepoMetadata, Store, SyncLease, SyncPhase, SyncResult};
 
 const API_URL: &str = "https://api.github.com/";
+const PAGE_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(500), Duration::from_secs(2)];
 pub(crate) const TOKEN_ENV: &str = "STARCHIVE_GITHUB_TOKEN";
 
 #[derive(Debug)]
@@ -25,6 +26,8 @@ pub enum GitHubError {
     },
     Http(StatusCode),
     InvalidResponse(reqwest::Error),
+    InterruptedStarPage(usize),
+    InvalidStarPage(usize),
     InvalidPagination,
     InvalidUrl(&'static str),
     InvalidReadme(&'static str),
@@ -46,6 +49,8 @@ impl std::fmt::Display for GitHubError {
             Self::RateLimited { .. } => f.write_str("GitHub rate limit reached. Wait before retrying."),
             Self::Http(status) => write!(f, "GitHub returned HTTP {status}. Retry if the failure is temporary."),
             Self::InvalidResponse(error) => write!(f, "GitHub returned an unreadable response: {error}"),
+            Self::InterruptedStarPage(page) => write!(f, "获取第 {page} 页星标时连接中断，自动重试两次后仍未成功。已保留原有资料，可稍后重试同步。"),
+            Self::InvalidStarPage(page) => write!(f, "GitHub 返回的第 {page} 页星标数据格式异常。已保留原有资料。"),
             Self::InvalidPagination => f.write_str("GitHub returned an invalid pagination link. Retry the sync."),
             Self::InvalidUrl(resource) => write!(f, "GitHub returned an invalid {resource} URL"),
             Self::InvalidReadme(message) => f.write_str(message),
@@ -60,6 +65,12 @@ impl std::error::Error for GitHubError {
             _ => None,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct Star {
+    starred_at: String,
+    repo: GitHubRepo,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,8 +174,8 @@ impl GitHub {
 
     async fn sync_with_lease(&self, lease: SyncLease) -> anyhow::Result<SyncResult> {
         let fetched = self
-            .starred_with_progress(|pages, repositories| {
-                lease.set_progress(SyncPhase::Fetching, pages, repositories)
+            .starred_with_progress(|phase, pages, repositories| {
+                lease.set_progress(phase, pages, repositories)
             })
             .await;
         match fetched {
@@ -178,7 +189,7 @@ impl GitHub {
 
     /// Fetch the entire authenticated star list before returning a snapshot.
     pub async fn starred(&self) -> Result<Vec<GitHubRepo>, GitHubError> {
-        let (repositories, _) = self.starred_with_progress(|_, _| ready(Ok(()))).await?;
+        let (repositories, _) = self.starred_with_progress(|_, _, _| ready(Ok(()))).await?;
         Ok(repositories)
     }
 
@@ -187,15 +198,9 @@ impl GitHub {
         F: Future<Output = Result<(), E>> + Send,
     >(
         &self,
-        mut report: impl FnMut(usize, usize) -> F,
+        mut report: impl FnMut(SyncPhase, usize, usize) -> F,
     ) -> Result<(Vec<GitHubRepo>, usize), E> {
-        #[derive(Deserialize)]
-        struct Star {
-            starred_at: String,
-            repo: GitHubRepo,
-        }
-
-        report(0, 0).await?;
+        report(SyncPhase::Fetching, 0, 0).await?;
         let token = self.token.as_ref().ok_or(GitHubError::Configuration(
             "Configure a GitHub credential with read access to your stars in Settings, with gh auth login, or with GH_TOKEN",
         ))?;
@@ -210,12 +215,21 @@ impl GitHub {
             if !visited.insert(url.clone()) {
                 return Err(GitHubError::InvalidPagination.into());
             }
-            let response = self
-                .get(url.clone(), "application/vnd.github.star+json", Some(token))
-                .await?;
-            let response = Self::check_status(response).await?;
-            let next = Self::next_page(&response, &url, &endpoint)?;
-            for star in Self::json::<Vec<Star>>(response).await? {
+            let mut delays = PAGE_RETRY_DELAYS.into_iter();
+            let (stars, next) = loop {
+                match self.starred_page(&url, &endpoint, token, pages + 1).await {
+                    Ok(page) => break page,
+                    Err(error @ GitHubError::InterruptedStarPage(_)) => {
+                        let Some(delay) = delays.next() else {
+                            return Err(error.into());
+                        };
+                        report(SyncPhase::Retrying, pages, repositories.len()).await?;
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            for star in stars {
                 Self::validate_repo_url(&star.repo)?;
                 repositories.push(GitHubRepo {
                     starred_at: Some(star.starred_at),
@@ -223,12 +237,45 @@ impl GitHub {
                 });
             }
             pages += 1;
-            report(pages, repositories.len()).await?;
+            report(SyncPhase::Fetching, pages, repositories.len()).await?;
             match next {
                 Some(next) => url = next,
                 None => return Ok((repositories, pages)),
             }
         }
+    }
+
+    async fn starred_page(
+        &self,
+        url: &Url,
+        endpoint: &Url,
+        token: &reqwest::header::HeaderValue,
+        page: usize,
+    ) -> Result<(Vec<Star>, Option<Url>), GitHubError> {
+        let response = self
+            .get(url.clone(), "application/vnd.github.star+json", Some(token))
+            .await
+            .map_err(|error| match error {
+                GitHubError::Transport(ref cause) if cause.is_timeout() => {
+                    GitHubError::InterruptedStarPage(page)
+                }
+                other => other,
+            })?;
+        let response = Self::check_status(response).await?;
+        let next = Self::next_page(&response, url, endpoint)?;
+        // Finish reading the HTTP body before decoding it or advancing the pagination cursor.
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| GitHubError::InterruptedStarPage(page))?;
+        let stars = serde_json::from_slice(&body).map_err(|error| {
+            if error.is_eof() {
+                GitHubError::InterruptedStarPage(page)
+            } else {
+                GitHubError::InvalidStarPage(page)
+            }
+        })?;
+        Ok((stars, next))
     }
 
     /// Call only for an explicit search expansion with public search terms.
@@ -510,6 +557,10 @@ impl GitHub {
             .map_err(|error| GitHubError::InvalidResponse(error.without_url()))
     }
 }
+
+#[cfg(test)]
+#[path = "github/page_retry_tests.rs"]
+mod page_retry_tests;
 
 #[cfg(test)]
 mod tests {

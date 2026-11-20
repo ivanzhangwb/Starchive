@@ -83,6 +83,7 @@ pub struct SyncResult {
 pub enum SyncPhase {
     Preparing,
     Fetching,
+    Retrying,
     Saving,
 }
 

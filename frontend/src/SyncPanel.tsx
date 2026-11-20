@@ -103,6 +103,7 @@ export function useLibrarySync(onSettled: () => void) {
 const phaseLabels = {
   preparing: '正在准备同步',
   fetching: '正在获取星标',
+  retrying: '连接中断，正在重试',
   saving: '正在保存资料库',
 }
 
@@ -117,7 +118,9 @@ export function SyncPanel({ sync, onOpenSettings }: {
   const success = !running && !failure && result?.state === 'success' ? result : null
   const progress = status?.running ? status.progress : null
   const showCounts = running && progress && progress.phase !== 'preparing'
-  const phase = running && (progress ? phaseLabels[progress.phase] : status?.running ? '正在同步星标' : phaseLabels.preparing)
+  const phase = progress?.phase === 'retrying'
+    ? `${phaseLabels.retrying}第 ${progress.pages + 1} 页`
+    : running && (progress ? phaseLabels[progress.phase] : status?.running ? '正在同步星标' : phaseLabels.preparing)
 
   return (
     <section className="sync" aria-labelledby="sync-heading">
