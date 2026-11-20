@@ -47,7 +47,13 @@ h2 { font-size: 1.0625rem; line-height: 1.35; }
 .local-status { display: inline-flex; align-items: center; gap: .375rem; color: var(--muted); font-size: .8125rem; white-space: nowrap; }
 .compact-nav { display: none; gap: .25rem; }
 .header-settings { flex: none; white-space: nowrap; }
-.workspace { display: grid; grid-template-columns: clamp(10.75rem, 15vw, 14rem) minmax(0, 1fr) clamp(20rem, 29vw, 28rem); min-height: 0; }
+.workspace { position: relative; display: grid; grid-template-columns: var(--left-width) minmax(0, 1fr) var(--right-width); min-height: 0; }
+.pane-divider { position: absolute; z-index: 1; inset-block: 0; width: 10px; cursor: col-resize; touch-action: none; user-select: none; -webkit-user-select: none; }
+.divider-left { left: var(--left-width); transform: translateX(-50%); }
+.divider-right { right: var(--right-width); transform: translateX(50%); }
+.pane-divider::after { content: ''; position: absolute; inset-block: 0; left: 4px; width: 2px; }
+.pane-divider:hover::after, .pane-divider:focus-visible::after, .pane-divider:active::after { background: var(--accent); }
+.workspace[data-resizing] { cursor: col-resize; user-select: none; -webkit-user-select: none; }
 .sidebar, .main-pane, .agent-pane { min-width: 0; min-height: 0; }
 
 .sidebar { display: flex; flex-direction: column; gap: 1.5rem; padding: 1.5rem 1rem; background: var(--rail); border-right: 1px solid var(--line); overflow: auto; }
@@ -256,7 +262,8 @@ dialog::backdrop { background: #10182054; }
 @media (max-width: 53.75rem) {
   .compact-nav { display: flex; }
   .local-status { display: none; }
-  .workspace { grid-template-columns: 10.75rem minmax(0, 1fr); }
+  .workspace { grid-template-columns: var(--left-width) minmax(0, 1fr); }
+  .divider-right, .app[data-compact-pane="agent"] .pane-divider { display: none; }
   .app[data-compact-pane="library"] .agent-pane,
   .app[data-compact-pane="agent"] .sidebar,
   .app[data-compact-pane="agent"] .main-pane { display: none; }
@@ -266,6 +273,7 @@ dialog::backdrop { background: #10182054; }
 }
 
 @media (max-width: 36rem) {
+  .pane-divider { display: none; }
   :root { --feed-gutter: 1rem; }
   .topbar { gap: .5rem; min-height: 3.5rem; padding: .5rem var(--feed-gutter); }
   .header-actions { gap: .375rem; }

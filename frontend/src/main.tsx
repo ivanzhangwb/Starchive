@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client'
 import { AgentPane } from './AgentPane'
 import type { Repo } from './api'
 import { Library } from './Library'
+import { ResizableWorkspace } from './ResizableWorkspace'
 import type { RepoSelection } from './RepoDetails'
 import { SettingsDialog } from './SettingsDialog'
 import './styles.css'
@@ -38,7 +39,7 @@ function App() {
           <button className="button header-settings" type="button" aria-label="设置" aria-haspopup="dialog" onClick={openSettings}><Settings size={17} aria-hidden="true" /><span>设置</span></button>
         </div>
       </header>
-      <div className="workspace">
+      <ResizableWorkspace>
         <Library
           selection={selection}
           activeSessionId={activeSessionId}
@@ -59,7 +60,7 @@ function App() {
           onSessionChange={setActiveSessionId}
           onOpenSettings={openSettings}
         />
-      </div>
+      </ResizableWorkspace>
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} onDetected={refreshAgents} />}
     </div>
   )

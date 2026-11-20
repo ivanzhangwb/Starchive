@@ -88,7 +88,7 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
 
   return (
     <>
-      <aside className="sidebar" aria-label="资料库控制">
+      <aside className="sidebar" id="library-sidebar" aria-label="资料库控制">
         <div className="sidebar-controls">
           <div>
             <h2 className="rail-label">资料库</h2>
