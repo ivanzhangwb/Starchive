@@ -1,6 +1,6 @@
-# Starchive
+# 星笺 · Starfolio
 
-Starchive 将 GitHub 星标、个人整理和选型对话保存在本机。桌面端和独立命令 `starchive` 共用 SQLite。可离线浏览和搜索资料库、编辑笔记、查看已缓存的 README 和恢复对话。
+星笺（Starfolio）将 GitHub 星标、个人整理和选型对话保存在本机。桌面端和独立命令 `starchive` 共用 SQLite。可离线浏览和搜索资料库、编辑笔记、查看已缓存的 README 和恢复对话。
 
 ## 安装与构建
 
@@ -13,7 +13,7 @@ npm --prefix desktop ci
 npm --prefix desktop run dev
 ```
 
-桌面开发命令会启动 Vite 和 Tauri 窗口。在仓库根目录运行下面的命令生成发布版。macOS 的应用和磁盘映像分别位于 `target/release/bundle/macos/Starchive.app` 和 `target/release/bundle/dmg/`。使用绝对路径设置 `CARGO_TARGET_DIR` 时，产物写入该目录下的 `release/bundle/`。
+桌面开发命令会启动 Vite 和 Tauri 窗口。在仓库根目录运行下面的命令生成发布版。macOS 的应用和磁盘映像分别位于 `target/release/bundle/macos/Starfolio.app` 和 `target/release/bundle/dmg/`。使用绝对路径设置 `CARGO_TARGET_DIR` 时，产物写入该目录下的 `release/bundle/`。
 
 ```sh
 npm --prefix desktop run build
@@ -44,7 +44,7 @@ starchive --json status
 
 ## 桌面对话
 
-选择本地 pi，描述需求，然后点开候选核对资料。点击「加入对话上下文」可分别授权私有资料和个人笔记。Starchive 在本机为收藏排序，把候选资料和近期对话控制在 32 KiB 的模型请求内。移除授权后，历史回复仍可在本机查看，后续模型请求遵循当前授权。旧版缓存的 README 可离线查看，点「刷新 README」后才能作为新的模型依据。pi 的模型推理可能联网。
+选择本地 pi，描述需求，然后点开候选核对资料。点击「加入对话上下文」可分别授权私有资料和个人笔记。星笺在本机为收藏排序，把候选资料和近期对话控制在 32 KiB 的模型请求内。移除授权后，历史回复仍可在本机查看，后续模型请求遵循当前授权。旧版缓存的 README 可离线查看，点「刷新 README」后才能作为新的模型依据。pi 的模型推理可能联网。
 
 点击「扩展到 GitHub 搜索」后输入公开搜索词，每次确认向 GitHub 发出一次查询。已返回的公开候选保存在会话中。可以在 GitHub 打开仓库并加星，随后同步到本地资料库。
 

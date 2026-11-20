@@ -52,8 +52,8 @@ fn config_dir() -> Option<PathBuf> {
 }
 
 fn config_for_write() -> Result<PathBuf> {
-    let dir = config_dir().context("Could not locate the Starchive settings directory")?;
-    fs::create_dir_all(&dir).context("Could not create the Starchive settings directory")?;
+    let dir = config_dir().context("Could not locate the Starfolio settings directory")?;
+    fs::create_dir_all(&dir).context("Could not create the Starfolio settings directory")?;
     Ok(dir)
 }
 

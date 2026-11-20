@@ -1,4 +1,4 @@
-import { Archive, HardDrive, LibraryBig, MessageSquare, Settings } from 'lucide-react'
+import { HardDrive, LibraryBig, MessageSquare, Settings } from 'lucide-react'
 import { useCallback, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { AgentPane } from './AgentPane'
@@ -29,7 +29,7 @@ function App() {
   return (
     <div className="app" data-compact-pane={compactPane}>
       <header className="topbar">
-        <div className="brand"><span className="brand-mark" aria-hidden="true"><Archive size={21} /></span>Starchive</div>
+        <div className="brand"><img className="brand-mark" src="./starfolio.svg" alt="" />星笺 · Starfolio</div>
         <div className="header-actions">
           <span className="local-status"><HardDrive size={15} aria-hidden="true" /> 本地资料库</span>
           <nav className="compact-nav" aria-label="工作区">

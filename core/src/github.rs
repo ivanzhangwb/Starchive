@@ -127,7 +127,7 @@ impl GitHub {
         let base = Url::parse(base)
             .map_err(|_| GitHubError::Configuration("Invalid GitHub API base URL"))?;
         let http = Client::builder()
-            .user_agent(concat!("Starchive/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("Starfolio/", env!("CARGO_PKG_VERSION")))
             .redirect(Policy::none())
             .retry(reqwest::retry::never())
             .timeout(Duration::from_secs(30))

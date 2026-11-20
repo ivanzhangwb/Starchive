@@ -30,7 +30,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![dispatch, agent_send_stream])
         .run(tauri::generate_context!())
-        .expect("Could not launch Starchive");
+        .expect("Could not launch Starfolio");
 }
 
 #[tauri::command]

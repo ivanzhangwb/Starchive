@@ -84,7 +84,7 @@ export function SettingsDialog({ onClose, onDetected }: {
         </div>
         {status && <p>凭证来源 <strong>{sourceLabel(status.github.source, '系统钥匙串')}</strong></p>}
         {!status?.github.available && (
-          <p>Starchive 会检测 GitHub CLI（<code>gh</code>）已有的登录。也可以在终端运行 <code>gh auth login</code>，再回到这里重新检测，或在下方粘贴个人访问令牌（PAT）。</p>
+          <p>星笺会检测 GitHub CLI（<code>gh</code>）已有的登录。也可以在终端运行 <code>gh auth login</code>，再回到这里重新检测，或在下方粘贴个人访问令牌（PAT）。</p>
         )}
         <form className="dialog-form settings-form" onSubmit={(event) => {
           event.preventDefault()

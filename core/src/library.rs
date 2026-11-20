@@ -177,7 +177,7 @@ impl Store {
         sqlx::migrate!("./migrations")
             .run(&pool)
             .await
-            .context("Migrate the Starchive database")?;
+            .context("Migrate the Starfolio database")?;
 
         Ok(Self {
             pool,
