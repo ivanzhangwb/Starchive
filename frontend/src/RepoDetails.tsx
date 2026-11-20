@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowUpRight, BookOpen, Pencil, Plus, Save } from 'lucide-react'
+import { ArrowLeft, ArrowUpRight, BookOpen, Notebook, Pencil, Plus, Save } from 'lucide-react'
 import { useEffect, useState, type FormEvent } from 'react'
 import { dispatch, errorMessage, type LibraryRepo, type Repo, type RepoDetail } from './api'
 import { Loading, Markdown, Notice, RepoState } from './ui'
@@ -138,10 +138,15 @@ export function RepoDetails({ selection, activeSessionId, syncTimestamp, revisio
       {repo && (
         <>
           <header className="detail-heading">
-            <RepoState repo={repo} />
-            <h1>{repo.full_name}</h1>
+            <div className="detail-title">
+              <span className="repo-mark" aria-hidden="true"><Notebook size={22} /></span>
+              <h1>{repo.full_name}</h1>
+            </div>
             {repo.description && <p>{repo.description}</p>}
-            {repo.language && <span className="language"><i />{repo.language}</span>}
+            <div className="row-meta">
+              {repo.language && <span className="language"><i />{repo.language}</span>}
+              <RepoState repo={repo} />
+            </div>
             <div className="button-row">
               <button type="button" className="button primary" disabled={contextLocked || otherSession} onClick={() => onContext(repo)}>
                 <Plus size={16} /> 加入对话上下文

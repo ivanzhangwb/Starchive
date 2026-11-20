@@ -28,9 +28,9 @@ function App() {
   return (
     <div className="app" data-compact-pane={compactPane}>
       <header className="topbar">
-        <div className="brand"><span className="brand-mark"><Archive size={21} /></span>Starchive</div>
+        <div className="brand"><span className="brand-mark" aria-hidden="true"><Archive size={21} /></span>Starchive</div>
         <div className="header-actions">
-          <span className="local-status"><HardDrive size={15} /> 本地资料库</span>
+          <span className="local-status"><HardDrive size={15} aria-hidden="true" /> 本地资料库</span>
           <nav className="compact-nav" aria-label="工作区">
             <button className="icon-button" type="button" aria-pressed={compactPane === 'library'} aria-label="资料库" onClick={() => setCompactPane('library')}><LibraryBig size={18} /></button>
             <button className="icon-button" type="button" aria-pressed={compactPane === 'agent'} aria-label="Agent 会话" onClick={() => setCompactPane('agent')}><MessageSquare size={18} /></button>

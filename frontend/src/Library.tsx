@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight, Database, Github, Search, Star, X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Database, Github, Notebook, Search, Star, X } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { dispatch, errorMessage, type Filters, type Repo, type RepoPage, type StarStatus } from './api'
 import { RepoDetails, type RepoSelection } from './RepoDetails'
@@ -89,7 +89,6 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
   return (
     <>
       <aside className="sidebar" aria-label="资料库控制">
-        <SyncPanel sync={sync} onOpenSettings={onOpenSettings} />
         <div className="sidebar-controls">
           <div>
             <h2 className="rail-label">资料库</h2>
@@ -111,6 +110,7 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
             <FilterSelect label="标签" value={filters.tag} options={page?.tags ?? []} disabled={!page} onChange={(tag) => changeFilters({ tag })} />
           </div>
         </div>
+        <SyncPanel sync={sync} onOpenSettings={onOpenSettings} />
       </aside>
       <main className="main-pane" id="library">
         {selection ? (
@@ -143,17 +143,21 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
             {page && !loading && !listError && (
               page.repos.length ? (
                 <>
-                  <ul className="repo-results">
+                  <ul className="repo-results" role="list">
                     {page.repos.map((repo) => (
                       <li key={repo.id}>
                         <button type="button" className="repo-row" onClick={() => onSelect({ id: repo.id, fallback: repo })}>
-                          <div className="repo-row-heading"><strong>{repo.full_name}</strong><ChevronRight size={16} /></div>
-                          {repo.description && <p>{repo.description}</p>}
-                          <div className="row-meta">
-                            {repo.language && <span className="language"><i />{repo.language}</span>}
-                            <RepoState repo={repo} />
-                            {repo.tags.map((tag) => <span className="tag" key={tag}>{tag}</span>)}
-                          </div>
+                          <span className="repo-mark" aria-hidden="true"><Notebook size={17} /></span>
+                          <span className="repo-row-content">
+                            <strong className="repo-row-name">{repo.full_name}</strong>
+                            {repo.description && <span className="repo-description">{repo.description}</span>}
+                            <span className="row-meta">
+                              {repo.language && <span className="language"><i />{repo.language}</span>}
+                              <RepoState repo={repo} />
+                              {repo.tags.map((tag) => <span className="tag" key={tag}>{tag}</span>)}
+                            </span>
+                          </span>
+                          <ChevronRight className="repo-chevron" size={17} aria-hidden="true" />
                         </button>
                       </li>
                     ))}

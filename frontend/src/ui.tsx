@@ -1,5 +1,5 @@
 import { AlertCircle, LockKeyhole, X } from 'lucide-react'
-import { useLayoutEffect, useRef, type ReactNode } from 'react'
+import { useId, useLayoutEffect, useRef, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { Repo } from './api'
@@ -7,8 +7,8 @@ import type { Repo } from './api'
 export function Notice({ children, retry }: { children: ReactNode; retry?: () => void }) {
   return (
     <div className="notice" role="alert">
-      <AlertCircle size={16} />
-      <span>{children}</span>
+      <AlertCircle size={16} aria-hidden="true" />
+      <div className="notice-content">{children}</div>
       {retry && <button type="button" className="text-button" onClick={retry}>重试</button>}
     </div>
   )
@@ -57,6 +57,7 @@ export function Dialog({ title, children, onClose, busy, className, showClose }:
   showClose?: boolean
 }) {
   const ref = useRef<HTMLDialogElement>(null)
+  const titleId = useId()
 
   useLayoutEffect(() => {
     const dialog = ref.current
@@ -68,14 +69,14 @@ export function Dialog({ title, children, onClose, busy, className, showClose }:
     <dialog
       ref={ref}
       className={className}
-      aria-label={title}
+      aria-labelledby={titleId}
       onCancel={(event) => {
         event.preventDefault()
         if (!busy) onClose()
       }}
     >
       <div className="section-heading">
-        <h2>{title}</h2>
+        <h2 id={titleId}>{title}</h2>
         {showClose && <button type="button" className="icon-button" aria-label={`关闭${title}`} disabled={busy} onClick={onClose}><X size={19} aria-hidden="true" /></button>}
       </div>
       {children}
