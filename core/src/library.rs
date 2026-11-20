@@ -125,6 +125,7 @@ pub struct Store {
 #[must_use = "hold the lease until pagination and snapshot recording finish"]
 pub struct SyncLease {
     pool: SqlitePool,
+    progress_pool: SqlitePool,
     _lock: FileLock,
 }
 
@@ -431,6 +432,15 @@ impl Store {
 
         Ok(Some(SyncLease {
             pool: self.pool.clone(),
+            // A progress notification may skip a page when another process is editing.
+            // The final snapshot still uses the regular connection and its write timeout.
+            progress_pool: SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_lazy_with(
+                    (*self.pool.connect_options())
+                        .clone()
+                        .busy_timeout(Duration::ZERO),
+                ),
             _lock: lock,
         }))
     }
@@ -481,15 +491,22 @@ impl SyncLease {
         pages: usize,
         repositories: usize,
     ) -> Result<()> {
-        sqlx::query("UPDATE library_sync_status SET progress = ? WHERE id = 1")
+        let result = sqlx::query("UPDATE library_sync_status SET progress = ? WHERE id = 1")
             .bind(Json(SyncProgress {
                 phase,
                 pages,
                 repositories,
             }))
-            .execute(&self.pool)
-            .await
-            .context("Record GitHub sync progress")?;
+            .execute(&self.progress_pool)
+            .await;
+        if let Err(sqlx::Error::Database(error)) = &result {
+            // SQLite's extended result codes keep the primary code in the low byte.
+            let code = error.code().and_then(|value| value.parse::<i32>().ok());
+            if matches!(code.map(|value| value & 0xff), Some(5 | 6)) {
+                return Ok(());
+            }
+        }
+        result.context("Record GitHub sync progress")?;
         Ok(())
     }
 
@@ -687,4 +704,32 @@ async fn try_lock(path: &Path) -> Result<Option<FileLock>> {
         }
     })
     .await?
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_active_writer_does_not_stall_or_abort_page_progress() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let store = Store::open(&folder.path().join("library.sqlite")).await?;
+        let lease = store.try_sync_lease().await?.unwrap();
+        lease.set_progress(SyncPhase::Fetching, 0, 0).await?;
+        let writer = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            lease.set_progress(SyncPhase::Fetching, 1, 100),
+        )
+        .await??;
+        writer.rollback().await?;
+        lease.set_progress(SyncPhase::Fetching, 2, 200).await?;
+        assert_eq!(
+            store.sync_status().await?.progress.unwrap().repositories,
+            200
+        );
+        lease.complete_snapshot(&[]).await?;
+        assert!(!store.sync_status().await?.in_progress);
+        Ok(())
+    }
 }
