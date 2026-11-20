@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     types::Json,
-    FromRow, SqlitePool,
+    FromRow, QueryBuilder, Sqlite, SqlitePool,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromRow)]
@@ -35,6 +35,17 @@ pub struct Repository {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct FieldEdit<T> {
+    pub expected: T,
+    pub value: T,
+}
+
+pub enum PatchResult {
+    Saved(Repository),
+    Conflict(Repository),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RepoQuery {
@@ -45,6 +56,13 @@ pub struct RepoQuery {
     pub public_only: bool,
     /// Skip personal notes when matching the query.
     pub exclude_notes: bool,
+}
+
+pub struct RepositoryPage {
+    pub repositories: Vec<Repository>,
+    pub total: i64,
+    pub languages: Vec<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromRow)]
@@ -81,6 +99,7 @@ struct SyncState {
 #[derive(Clone, Debug)]
 pub struct Store {
     pool: SqlitePool,
+    path: PathBuf,
     sync_lock_path: PathBuf,
 }
 
@@ -92,7 +111,7 @@ pub struct SyncLease {
 }
 
 #[derive(Debug)]
-struct FileLock(File);
+pub(crate) struct FileLock(File);
 
 impl Drop for FileLock {
     fn drop(&mut self) {
@@ -143,11 +162,19 @@ impl Store {
         Ok(Self {
             pool,
             sync_lock_path: lock_path(&path, "-starchive-sync.lock"),
+            path,
         })
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub(crate) async fn lock_conversation(&self, session_id: i64) -> Result<FileLock> {
+        let path = lock_path(&self.path, &format!("-starchive-session-{session_id}.lock"));
+        try_lock(&path)
+            .await?
+            .context("The conversation is busy. Wait for the current reply or change, then retry.")
     }
 
     pub async fn get_repository(&self, id: i64) -> Result<Option<Repository>> {
@@ -167,33 +194,70 @@ impl Store {
     }
 
     pub async fn list_repositories(&self, query: &RepoQuery) -> Result<Vec<Repository>> {
-        let term = query
-            .query
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        Ok(repository_query("SELECT r.*", query)
+            .push(" ORDER BY r.full_name, r.id")
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    pub async fn repositories_by_id(&self, ids: &[i64]) -> Result<Vec<Repository>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
         Ok(sqlx::query_as(
-            "SELECT r.* FROM repositories r
-             WHERE (?1 IS NULL
-                    OR instr(lower(r.full_name), lower(?1)) > 0
-                    OR instr(lower(r.description), lower(?1)) > 0
-                    OR (NOT ?6 AND instr(lower(r.note), lower(?1)) > 0))
-               AND (?2 IS NULL OR r.language = ?2 COLLATE NOCASE)
-               AND (?3 IS NULL OR EXISTS (
-                   SELECT 1 FROM json_each(r.tags) WHERE value = ?3 COLLATE NOCASE
-               ))
-               AND (?4 IS NULL OR r.starred = ?4)
-               AND (NOT ?5 OR NOT r.private)
-             ORDER BY r.full_name, r.id",
+            "SELECT r.* FROM repositories r JOIN json_each(?) AS ids ON r.id = ids.value",
         )
-        .bind(term)
-        .bind(query.language.as_deref().map(str::trim))
-        .bind(query.tag.as_deref().map(str::trim))
-        .bind(query.starred)
-        .bind(query.public_only)
-        .bind(query.exclude_notes)
+        .bind(Json(ids))
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    pub async fn page_repositories(
+        &self,
+        query: &RepoQuery,
+        offset: usize,
+        limit: usize,
+    ) -> Result<RepositoryPage> {
+        let mut snapshot = self.pool.begin().await?;
+        let total = repository_query("SELECT count(*)", query)
+            .build_query_scalar()
+            .fetch_one(&mut *snapshot)
+            .await?;
+        let repositories = repository_query("SELECT r.*", query)
+            .push(" ORDER BY r.full_name, r.id LIMIT ")
+            .push_bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .push(" OFFSET ")
+            .push_bind(i64::try_from(offset).unwrap_or(i64::MAX))
+            .build_query_as()
+            .fetch_all(&mut *snapshot)
+            .await?;
+        let languages = sqlx::query_scalar(
+            "SELECT DISTINCT language FROM repositories
+             WHERE (? IS NULL OR starred = ?) AND (NOT ? OR NOT private) AND language IS NOT NULL
+             ORDER BY language",
+        )
+        .bind(query.starred)
+        .bind(query.starred)
+        .bind(query.public_only)
+        .fetch_all(&mut *snapshot)
+        .await?;
+        let tags = sqlx::query_scalar(
+            "SELECT DISTINCT tag.value FROM repositories, json_each(repositories.tags) AS tag
+             WHERE (? IS NULL OR starred = ?) AND (NOT ? OR NOT private) ORDER BY tag.value",
+        )
+        .bind(query.starred)
+        .bind(query.starred)
+        .bind(query.public_only)
+        .fetch_all(&mut *snapshot)
+        .await?;
+        snapshot.commit().await?;
+        Ok(RepositoryPage {
+            repositories,
+            total,
+            languages,
+            tags,
+        })
     }
 
     pub async fn edit_repository(
@@ -202,6 +266,44 @@ impl Store {
         note: Option<&str>,
         tags: Option<&[String]>,
     ) -> Result<Repository> {
+        self.update_repository(id, note, tags, None, None)
+            .await?
+            .with_context(|| format!("Repository {id} is missing from the local library"))
+    }
+
+    pub async fn patch_repository(
+        &self,
+        id: i64,
+        note: Option<&FieldEdit<String>>,
+        tags: Option<&FieldEdit<Vec<String>>>,
+    ) -> Result<PatchResult> {
+        if let Some(repo) = self
+            .update_repository(
+                id,
+                note.map(|edit| edit.value.as_str()),
+                tags.map(|edit| edit.value.as_slice()),
+                note.map(|edit| edit.expected.as_str()),
+                tags.map(|edit| edit.expected.as_slice()),
+            )
+            .await?
+        {
+            return Ok(PatchResult::Saved(repo));
+        }
+        let current = self
+            .get_repository(id)
+            .await?
+            .with_context(|| format!("Repository {id} is missing from the local library"))?;
+        Ok(PatchResult::Conflict(current))
+    }
+
+    async fn update_repository(
+        &self,
+        id: i64,
+        note: Option<&str>,
+        tags: Option<&[String]>,
+        expected_note: Option<&str>,
+        expected_tags: Option<&[String]>,
+    ) -> Result<Option<Repository>> {
         let tags = tags.map(|tags| {
             let mut seen = HashSet::new();
             tags.iter()
@@ -209,17 +311,20 @@ impl Store {
                 .filter(|tag| !tag.is_empty() && seen.insert(tag.to_ascii_lowercase()))
                 .collect::<Vec<_>>()
         });
-        sqlx::query_as(
+        Ok(sqlx::query_as(
             "UPDATE repositories
-             SET note = COALESCE(?, note), tags = COALESCE(?, tags)
-             WHERE id = ? RETURNING *",
+             SET note = COALESCE(?1, note), tags = COALESCE(?2, tags)
+             WHERE id = ?3 AND (?4 IS NULL OR note = ?4)
+               AND (?5 IS NULL OR json(tags) = json(?5))
+             RETURNING *",
         )
         .bind(note)
         .bind(tags.map(Json))
         .bind(id)
+        .bind(expected_note)
+        .bind(expected_tags.map(Json))
         .fetch_optional(&self.pool)
-        .await?
-        .with_context(|| format!("Repository {id} is missing from the local library"))
+        .await?)
     }
 
     pub async fn get_readme(&self, id: i64) -> Result<Option<Readme>> {
@@ -231,31 +336,52 @@ impl Store {
         .await?)
     }
 
-    /// Read cached content only if the selected name and visibility still match.
     pub async fn get_readme_for(
         &self,
         id: i64,
         full_name: &str,
         private: bool,
     ) -> Result<Option<Readme>> {
+        self.readme_for(id, full_name, private, false).await
+    }
+
+    /// Legacy cache entries remain available offline while model input requires verified identity.
+    pub(crate) async fn verified_readme_for(
+        &self,
+        id: i64,
+        full_name: &str,
+        private: bool,
+    ) -> Result<Option<Readme>> {
+        self.readme_for(id, full_name, private, true).await
+    }
+
+    async fn readme_for(
+        &self,
+        id: i64,
+        full_name: &str,
+        private: bool,
+        verified_only: bool,
+    ) -> Result<Option<Readme>> {
         Ok(sqlx::query_as(
             "SELECT readme.content, readme.source_url FROM repository_readmes readme
              JOIN repositories repo ON repo.id = readme.repository_id
-             WHERE repo.id = ? AND repo.full_name = ? AND repo.private = ?",
+             WHERE repo.id = ? AND repo.full_name = ? AND repo.private = ?
+               AND (NOT ? OR readme.identity_verified)",
         )
         .bind(id)
         .bind(full_name)
         .bind(private)
+        .bind(verified_only)
         .fetch_optional(&self.pool)
         .await?)
     }
 
     pub async fn cache_readme(&self, repo: &RepoMetadata, readme: &Readme) -> Result<bool> {
         let result = sqlx::query(
-            "INSERT INTO repository_readmes (repository_id, content, source_url)
-             SELECT id, ?, ? FROM repositories WHERE id = ? AND full_name = ? AND private = ?
+            "INSERT INTO repository_readmes (repository_id, content, source_url, identity_verified)
+             SELECT id, ?, ?, TRUE FROM repositories WHERE id = ? AND full_name = ? AND private = ?
              ON CONFLICT(repository_id) DO UPDATE SET
-                 content = excluded.content, source_url = excluded.source_url",
+                 content = excluded.content, source_url = excluded.source_url, identity_verified = TRUE",
         )
         .bind(&readme.content)
         .bind(&readme.source_url)
@@ -325,15 +451,16 @@ impl SyncLease {
     pub async fn complete_snapshot(self, repositories: &[RepoMetadata]) -> Result<SyncResult> {
         match self.apply_snapshot(repositories).await {
             Ok(result) => Ok(result),
-            Err(error) => {
-                let message = format!("{error:#}");
-                match self.record_failure(&message).await {
-                    Ok(()) => Err(error),
-                    Err(status_error) => Err(error.context(format!(
-                        "Could not record the sync failure: {status_error:#}"
-                    ))),
-                }
-            }
+            Err(error) => Err(self.fail(error).await),
+        }
+    }
+
+    pub(crate) async fn fail(self, error: anyhow::Error) -> anyhow::Error {
+        match self.record_failure(&format!("{error:#}")).await {
+            Ok(()) => error,
+            Err(status_error) => error.context(format!(
+                "Could not record the sync failure: {status_error:#}"
+            )),
         }
     }
 
@@ -411,6 +538,50 @@ impl SyncLease {
     }
 }
 
+fn repository_query<'a>(select: &str, filters: &'a RepoQuery) -> QueryBuilder<'a, Sqlite> {
+    let mut query = QueryBuilder::new(select);
+    query.push(" FROM repositories r WHERE TRUE");
+    if let Some(term) = filters
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+    {
+        query
+            .push(" AND (instr(lower(r.full_name), lower(")
+            .push_bind(term)
+            .push(")) > 0 OR instr(lower(r.description), lower(")
+            .push_bind(term)
+            .push(")) > 0");
+        if !filters.exclude_notes {
+            query
+                .push(" OR instr(lower(r.note), lower(")
+                .push_bind(term)
+                .push(")) > 0");
+        }
+        query.push(")");
+    }
+    if let Some(language) = &filters.language {
+        query
+            .push(" AND r.language = ")
+            .push_bind(language.trim())
+            .push(" COLLATE NOCASE");
+    }
+    if let Some(tag) = &filters.tag {
+        query
+            .push(" AND EXISTS (SELECT 1 FROM json_each(r.tags) WHERE value = ")
+            .push_bind(tag.trim())
+            .push(" COLLATE NOCASE)");
+    }
+    if let Some(starred) = filters.starred {
+        query.push(" AND r.starred = ").push_bind(starred);
+    }
+    if filters.public_only {
+        query.push(" AND NOT r.private");
+    }
+    query
+}
+
 fn lock_path(database: &Path, suffix: &str) -> PathBuf {
     let mut path = database.as_os_str().to_owned();
     path.push(suffix);
@@ -432,12 +603,12 @@ async fn try_lock(path: &Path) -> Result<Option<FileLock>> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let lock =
-            open_local_file(&path).with_context(|| format!("Open sync lock {}", path.display()))?;
+            open_local_file(&path).with_context(|| format!("Open lock {}", path.display()))?;
         match lock.try_lock() {
             Ok(()) => Ok(Some(FileLock(lock))),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => {
-                Err(error).with_context(|| format!("Acquire sync lock {}", path.display()))
+                Err(error).with_context(|| format!("Acquire lock {}", path.display()))
             }
         }
     })

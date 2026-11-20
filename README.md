@@ -13,7 +13,7 @@ npm --prefix desktop ci
 npm --prefix desktop run dev
 ```
 
-桌面开发命令会启动 Vite 和 Tauri 窗口。生成安装包和发布版二进制可运行下面的命令。Tauri 将产物写入 `target/release/bundle/`。
+桌面开发命令会启动 Vite 和 Tauri 窗口。在仓库根目录运行下面的命令生成发布版。macOS 的应用和磁盘映像分别位于 `target/release/bundle/macos/Starchive.app` 和 `target/release/bundle/dmg/`。使用绝对路径设置 `CARGO_TARGET_DIR` 时，产物写入该目录下的 `release/bundle/`。
 
 ```sh
 npm --prefix desktop run build
@@ -23,7 +23,7 @@ npm --prefix desktop run build
 
 - 默认数据库位于操作系统的本机应用数据目录，文件名为 `Starchive/library.sqlite3`。macOS 上为 `~/Library/Application Support/Starchive/library.sqlite3`。设置 `STARCHIVE_DB_PATH` 可让两个入口使用同一个指定文件。CLI 也可用 `--db FILE` 单独指定路径。
 - 设置 `STARCHIVE_GITHUB_TOKEN` 后启动桌面端或运行 `starchive sync`。GitHub 细粒度令牌需要 Starring 读取权限。获取私有仓库 README 还需要该仓库的 Contents 读取权限。公开 README 和公开搜索使用匿名请求。
-- 桌面端使用 `PATH` 上的 `pi`，也可以设置 `STARCHIVE_PI_PATH` 指向可执行文件。先在 pi 中配置模型并确认可用。使用终端设置环境变量时，从同一个终端运行 `npm --prefix desktop run dev`，或启动发布包里的 `Starchive.app/Contents/MacOS/starchive-desktop`（macOS），让应用继承配置。
+- 桌面端使用 `PATH` 上的 `pi`，也可以设置 `STARCHIVE_PI_PATH` 指向可执行文件。先在 pi 中配置模型并确认可用。使用终端设置环境变量时，从仓库根目录运行 `npm --prefix desktop run dev`，或在同一终端运行 `"${CARGO_TARGET_DIR:-target}/release/bundle/macos/Starchive.app/Contents/MacOS/starchive-desktop"`（macOS），让应用继承配置。
 
 ## CLI
 
@@ -39,11 +39,11 @@ starchive edit owner/repo --clear-tags
 starchive --json status
 ```
 
-`show` 和 `edit` 也接受 GitHub 仓库的数字 ID。`--note ''` 清空笔记。同步完整拉取星标后再更新资料库，保留笔记与标签。通过 `--status unstarred` 可查看已取消星标的条目。
+`show` 和 `edit` 也接受 GitHub 仓库的数字 ID。`--note ''` 清空笔记。同步完整拉取星标后再更新资料库，保留笔记与标签。通过 `--status unstarred` 可查看已取消星标的条目。桌面窗口恢复焦点时会刷新资料。若另一窗口或 CLI 已修改草稿中的同一字段，桌面会保留草稿并提示核对当前值。
 
 ## 桌面对话
 
-选择本地 pi，描述需求，然后点开候选核对资料。点击「加入对话上下文」可分别授权私有资料和个人笔记。移除授权后，历史回复仍可在本机查看，后续模型请求遵循当前授权。pi 的模型推理可能联网。
+选择本地 pi，描述需求，然后点开候选核对资料。点击「加入对话上下文」可分别授权私有资料和个人笔记。Starchive 在本机为收藏排序，把候选资料和近期对话控制在 32 KiB 的模型请求内。移除授权后，历史回复仍可在本机查看，后续模型请求遵循当前授权。旧版缓存的 README 可离线查看，点「刷新 README」后才能作为新的模型依据。pi 的模型推理可能联网。
 
 点击「扩展到 GitHub 搜索」后输入公开搜索词，每次确认向 GitHub 发出一次查询。已返回的公开候选保存在会话中。可以在 GitHub 打开仓库并加星，随后同步到本地资料库。
 

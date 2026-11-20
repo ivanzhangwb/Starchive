@@ -94,6 +94,51 @@ async fn snapshot_preserves_organization_by_id_across_rename_and_unstar() -> Res
 }
 
 #[tokio::test]
+async fn repository_pages_count_filtered_matches_and_keep_scope_facets() -> Result<()> {
+    let dir = tempdir()?;
+    let store = Store::open(&dir.path().join("library.sqlite3")).await?;
+    let mut first = repo(1, "fixture/a");
+    first.language = Some("Rust".into());
+    let mut second = repo(2, "fixture/b");
+    second.language = Some("Rust".into());
+    let mut third = repo(3, "fixture/c");
+    third.language = Some("Go".into());
+    let starred = [first, second, third];
+    let mut initial = starred.to_vec();
+    initial.push(repo(4, "fixture/unstarred"));
+    sync(&store, &initial).await?;
+    store
+        .edit_repository(1, Some("Offline"), Some(&["Index".into()]))
+        .await?;
+    store
+        .edit_repository(2, Some("Offline"), Some(&["Index".into()]))
+        .await?;
+    store
+        .edit_repository(3, None, Some(&["Network".into()]))
+        .await?;
+    store
+        .edit_repository(4, None, Some(&["Archive".into()]))
+        .await?;
+    sync(&store, &starred).await?;
+    let query = RepoQuery {
+        query: Some(" offline ".into()),
+        language: Some("rust".into()),
+        tag: Some("INDEX".into()),
+        starred: Some(true),
+        ..RepoQuery::default()
+    };
+    let page = store.page_repositories(&query, 1, 1).await?;
+    assert_eq!(page.total, 2);
+    assert_eq!(page.repositories[0].metadata.id, 2);
+    assert_eq!(page.languages, ["Go", "Rust"]);
+    assert_eq!(page.tags, ["Index", "Network"]);
+    let past_end = store.page_repositories(&query, usize::MAX, 1).await?;
+    assert_eq!(past_end.total, 2);
+    assert!(past_end.repositories.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn search_composes_filters_and_edits_can_clear_individual_fields() -> Result<()> {
     let dir = tempdir()?;
     let store = Store::open(&dir.path().join("library.sqlite3")).await?;

@@ -176,6 +176,7 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
             selection={selection}
             activeSessionId={activeSessionId}
             syncTimestamp={lastSuccess}
+            revision={revision}
             contextLocked={contextLocked}
             onBack={() => onSelect(null)}
             onContext={onContext}

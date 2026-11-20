@@ -4,10 +4,10 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{redirect::Policy, Client, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 
-use crate::{Readme, RepoMetadata, Store, SyncResult};
+use crate::{Readme, RepoMetadata, Store, SyncLease, SyncResult};
 
 const API_URL: &str = "https://api.github.com/";
-const TOKEN_ENV: &str = "STARCHIVE_GITHUB_TOKEN";
+pub(crate) const TOKEN_ENV: &str = "STARCHIVE_GITHUB_TOKEN";
 
 #[derive(Debug)]
 pub enum GitHubError {
@@ -143,26 +143,33 @@ impl GitHub {
         Ok(Self { http, base, token })
     }
 
+    /// Record the attempt before reading configuration so setup failures are visible on reopen.
+    pub async fn sync_from_env(store: &Store) -> anyhow::Result<SyncResult> {
+        let lease = Self::sync_lease(store).await?;
+        match Self::from_env() {
+            Ok(client) => client.sync_with_lease(lease).await,
+            Err(error) => Err(lease.fail(error.into()).await),
+        }
+    }
+
     /// Update the local library only after every page of GitHub stars is available.
     pub async fn sync(&self, store: &Store) -> anyhow::Result<SyncResult> {
-        let lease = store.try_sync_lease().await?.ok_or_else(|| {
+        self.sync_with_lease(Self::sync_lease(store).await?).await
+    }
+
+    async fn sync_lease(store: &Store) -> anyhow::Result<SyncLease> {
+        store.try_sync_lease().await?.ok_or_else(|| {
             anyhow::anyhow!("GitHub sync is already in progress. Try again once it finishes.")
-        })?;
+        })
+    }
+
+    async fn sync_with_lease(&self, lease: SyncLease) -> anyhow::Result<SyncResult> {
         match self.starred().await {
             Ok(stars) => {
                 let repositories: Vec<_> = stars.into_iter().map(RepoMetadata::from).collect();
                 lease.complete_snapshot(&repositories).await
             }
-            Err(error) => {
-                let message = error.to_string();
-                let error = anyhow::Error::new(error);
-                match lease.record_failure(&message).await {
-                    Ok(()) => Err(error),
-                    Err(status_error) => Err(error.context(format!(
-                        "Could not record the GitHub sync failure: {status_error:#}"
-                    ))),
-                }
-            }
+            Err(error) => Err(lease.fail(error.into()).await),
         }
     }
 
@@ -235,10 +242,10 @@ impl GitHub {
         Ok(results)
     }
 
-    /// Fetch the default README for a selected public repository.
-    pub async fn readme(&self, full_name: &str) -> Result<Option<String>, GitHubError> {
+    /// Fetch the default README for a selected public repository by its stable GitHub ID.
+    pub async fn readme(&self, repository_id: i64) -> Result<Option<String>, GitHubError> {
         Ok(self
-            .readme_with_source(full_name)
+            .fetch_readme(repository_id, None)
             .await?
             .map(|readme| readme.content))
     }
@@ -256,7 +263,7 @@ impl GitHub {
         } else {
             None
         };
-        let Some(readme) = self.fetch_readme(&repo.full_name, token).await? else {
+        let Some(readme) = self.fetch_readme(repo.id, token).await? else {
             return Ok(None);
         };
         anyhow::ensure!(
@@ -266,14 +273,9 @@ impl GitHub {
         Ok(Some(readme))
     }
 
-    /// Fetch a public README and its GitHub file URL anonymously. A 404 means no visible README.
-    pub async fn readme_with_source(&self, full_name: &str) -> Result<Option<Readme>, GitHubError> {
-        self.fetch_readme(full_name, None).await
-    }
-
     async fn fetch_readme(
         &self,
-        full_name: &str,
+        repository_id: i64,
         token: Option<&reqwest::header::HeaderValue>,
     ) -> Result<Option<Readme>, GitHubError> {
         #[derive(Deserialize)]
@@ -283,18 +285,9 @@ impl GitHub {
             html_url: String,
         }
 
-        let invalid_name =
-            || GitHubError::Configuration("Use a GitHub repository name in owner/repo format");
-        let (owner, repo) = full_name.split_once('/').ok_or_else(invalid_name)?;
-        if [owner, repo]
-            .iter()
-            .any(|part| !Self::valid_name_part(part))
-        {
-            return Err(invalid_name());
-        }
         let url = self
             .base
-            .join(&format!("repos/{owner}/{repo}/readme"))
+            .join(&format!("repositories/{repository_id}/readme"))
             .expect("valid API endpoint");
         let response = self.get(url, "application/vnd.github+json", token).await?;
         if response.status() == StatusCode::NOT_FOUND {
@@ -663,19 +656,15 @@ mod tests {
             "html_url": "https://github.com/acme/search.rs/blob/main/docs/README.md",
         })
         .to_string();
-        let (result, request) = tokio::join!(
-            client.readme("acme/search.rs"),
-            server.reply(200, "", &readme),
-        );
+        let (result, request) = tokio::join!(client.readme(1), server.reply(200, "", &readme),);
         assert_eq!(
             request.lines().next(),
-            Some("GET /repos/acme/search.rs/readme HTTP/1.1")
+            Some("GET /repositories/1/readme HTTP/1.1")
         );
         assert!(!request.contains("authorization:"));
         assert_eq!(result.unwrap().as_deref(), Some("# 中文\n"));
 
-        let (result, _) =
-            tokio::join!(client.readme("acme/no-readme"), server.reply(404, "", "{}"),);
+        let (result, _) = tokio::join!(client.readme(2), server.reply(404, "", "{}"),);
         assert_eq!(result.unwrap(), None);
     }
 
@@ -815,12 +804,16 @@ mod tests {
         let body = json!({
             "encoding": "base64",
             "content": "IyBMb29rdXAK",
-            "html_url": "https://github.com/acme/selected/blob/trunk/README.md",
+            "html_url": "https://github.com/new-owner/renamed/blob/trunk/README.md",
         })
         .to_string();
         let (result, request) = tokio::join!(
             client.refresh_readme(&store, &metadata),
             server.reply(200, "", &body),
+        );
+        assert_eq!(
+            request.lines().next(),
+            Some("GET /repositories/1/readme HTTP/1.1")
         );
         assert!(request.contains("authorization: Bearer example-token"));
         assert_eq!(result.unwrap().unwrap().content, "# Lookup\n");
