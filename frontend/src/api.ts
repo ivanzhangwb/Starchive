@@ -41,6 +41,11 @@ export interface SyncStatus {
   last_result: { state: 'success'; starred_count: number } | { state: 'error'; message: string } | null
 }
 
+export interface SettingsStatus {
+  github: { available: boolean; source: string }
+  pi: { available: boolean; source: string; path: string | null }
+}
+
 export interface Agent {
   id: string
   name: string
@@ -93,6 +98,9 @@ type Dispatch = {
   repo_readme: [RepoId & { session_id: string | null }, { readme: string | null }]
   sync_status: [Empty, SyncStatus]
   sync_start: [Empty, SyncStatus]
+  settings_get: [Empty, SettingsStatus]
+  settings_save_github: [{ token: string | null }, SettingsStatus]
+  settings_save_pi: [{ path: string | null }, SettingsStatus]
   agent_list: [Empty, Agent[]]
   session_list: [Empty, SessionSummary[]]
   session_create: [{ agent_id: string | null }, Session]

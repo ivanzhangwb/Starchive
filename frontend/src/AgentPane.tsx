@@ -25,16 +25,18 @@ function rememberSession(id?: string) {
   }
 }
 
-export function AgentPane({ contextRepo, syncTimestamp, onContext, onCloseContext, onSelectRepo, onBusy, onSessionChange }: {
+export function AgentPane({ contextRepo, syncTimestamp, agentRevision, onContext, onCloseContext, onSelectRepo, onBusy, onSessionChange, onOpenSettings }: {
   contextRepo: Repo | null
   syncTimestamp: string | null
+  agentRevision: number
   onContext: (repo: Repo) => void
   onCloseContext: () => void
   onSelectRepo: (selection: RepoSelection) => void
   onBusy: (busy: boolean) => void
   onSessionChange: (id: string | null) => void
+  onOpenSettings: () => void
 }) {
-  const [agents, setAgents] = useState<Agent[]>([])
+  const [agents, setAgents] = useState<Agent[] | null>(null)
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [preferredAgent, setPreferredAgent] = useState('')
@@ -54,8 +56,8 @@ export function AgentPane({ contextRepo, syncTimestamp, onContext, onCloseContex
   const draftKey = session?.id ?? ''
   const draft = drafts[draftKey] ?? ''
   const agentId = session?.agent_id ?? (!session ? preferredAgent : '')
-  const selectedAgent = agents.find((agent) => agent.id === agentId)
-  const locked = loading || busy !== null
+  const selectedAgent = agents?.find((agent) => agent.id === agentId)
+  const locked = loading || (agents === null && !agentsError) || busy !== null
 
   function acceptSession(next: Session) {
     currentId.current = next.id
@@ -69,31 +71,32 @@ export function AgentPane({ contextRepo, syncTimestamp, onContext, onCloseContex
 
   useEffect(() => {
     let active = true
+    void dispatch('agent_list', {}).then((available) => {
+      if (!active) return
+      setAgents(available)
+      setAgentsError('')
+      setPreferredAgent((current) => current || available.find((agent) => agent.available)?.id || '')
+    }).catch((error: unknown) => {
+      if (active) setAgentsError(errorMessage(error))
+    })
+    return () => { active = false }
+  }, [agentRevision, retry])
+
+  useEffect(() => {
+    let active = true
     setLoading(true)
     setLoadError('')
-    setAgentsError('')
-    void Promise.allSettled([dispatch('agent_list', {}), dispatch('session_list', {})]).then(async ([available, saved]) => {
+    void dispatch('session_list', {}).then(async (saved) => {
       if (!active) return
-      if (available.status === 'fulfilled') {
-        setAgents(available.value)
-        setPreferredAgent((current) => current || available.value.find((agent) => agent.available)?.id || '')
-      } else {
-        setAgentsError(errorMessage(available.reason))
+      setSessions(saved)
+      const target = saved.find((item) => item.id === rememberSession()) ?? saved[0]
+      if (target) {
+        const restored = await dispatch('session_get', { session_id: target.id })
+        if (active) acceptSession(restored)
       }
-      if (saved.status === 'rejected') {
-        setLoadError(errorMessage(saved.reason))
-      } else {
-        setSessions(saved.value)
-        const target = saved.value.find((item) => item.id === rememberSession()) ?? saved.value[0]
-        if (target) {
-          try {
-            const restored = await dispatch('session_get', { session_id: target.id })
-            if (active) acceptSession(restored)
-          } catch (error) {
-            if (active) setLoadError(errorMessage(error))
-          }
-        }
-      }
+    }).catch((error: unknown) => {
+      if (active) setLoadError(errorMessage(error))
+    }).finally(() => {
       if (active) setLoading(false)
     })
     return () => { active = false }
@@ -193,6 +196,10 @@ export function AgentPane({ contextRepo, syncTimestamp, onContext, onCloseContex
   const retryLoad = () => setRetry((value) => value + 1)
   const existingContext = session?.context.find((item) => item.repo.id === contextRepo?.id)
   const visibleFailure = failure && !(failure.operation === 'context' && contextRepo) && !(failure.operation === 'search' && searchOpen)
+  const agentUnavailable = !loading && agents && !agents.some((agent) => agent.available)
+  const agentIssue = agentsError || (agentUnavailable
+    ? '未找到可用的本地 Agent。请在设置中检测或指定 pi 的路径。'
+    : !loading && agents && agentId && !selectedAgent?.available ? '当前 Agent 不可用。请检查设置或选择已安装的 Agent。' : '')
 
   return (
     <aside className="agent-pane" id="agent" aria-label="Agent 会话">
@@ -222,8 +229,8 @@ export function AgentPane({ contextRepo, syncTimestamp, onContext, onCloseContex
               else setPreferredAgent(id)
             }}>
               <option value="" disabled>选择 Agent</option>
-              {agentId && !selectedAgent && <option value={agentId} disabled>{agentId}（未找到）</option>}
-              {agents.map((agent) => <option value={agent.id} key={agent.id} disabled={!agent.available}>{agent.name}{agent.available ? '' : '（未安装）'}</option>)}
+              {agentId && !selectedAgent && <option value={agentId} disabled>{agentId}{agents ? '（未找到）' : ''}</option>}
+              {agents?.map((agent) => <option value={agent.id} key={agent.id} disabled={!agent.available}>{agent.name}{agent.available ? '' : '（不可用）'}</option>)}
             </select>
           </label>
         </div>
@@ -263,11 +270,12 @@ export function AgentPane({ contextRepo, syncTimestamp, onContext, onCloseContex
       </div>
       <div className="agent-footer">
         {visibleFailure && <Notice>{failure.message}</Notice>}
-        {agentsError ? <Notice retry={retryLoad}>{agentsError}</Notice> : !loading && !agents.some((agent) => agent.available) ? (
-          <Notice retry={retryLoad}>未找到可用的本地 Agent。安装 pi 或检查可执行文件配置后，请重试检测。</Notice>
-        ) : !loading && agentId && !selectedAgent?.available ? (
-          <Notice>当前 Agent 不可用。请选择已安装的 Agent。</Notice>
-        ) : null}
+        {agentIssue && (
+          <div className="settings-callout">
+            <Notice>{agentIssue}</Notice>
+            <button type="button" className="text-button" aria-haspopup="dialog" onClick={onOpenSettings}>打开 Agent 设置</button>
+          </div>
+        )}
         {session?.can_expand && (
           <button type="button" className="button expand-button" disabled={locked} onClick={() => { setFailure(null); setSearchTerms(''); setSearchOpen(true) }}>
             <Github size={16} /> 扩展到 GitHub 搜索 <ArrowRight size={15} />

@@ -12,13 +12,14 @@ const starScopes: { value: StarStatus; label: string }[] = [
 ]
 const pageSize = 100
 
-export function Library({ selection, activeSessionId, contextLocked, onSelect, onContext, onSync }: {
+export function Library({ selection, activeSessionId, contextLocked, onSelect, onContext, onSync, onOpenSettings }: {
   selection: RepoSelection | null
   activeSessionId: string | null
   contextLocked: boolean
   onSelect: (selection: RepoSelection | null) => void
   onContext: (repo: Repo) => void
   onSync: (timestamp: string | null) => void
+  onOpenSettings: () => void
 }) {
   const [filters, setFilters] = useState(defaultFilters)
   const [query, setQuery] = useState('')
@@ -163,7 +164,12 @@ export function Library({ selection, activeSessionId, contextLocked, onSelect, o
             {running && <span>正在同步星标…</span>}
             {!running && sync?.last_result?.state === 'success' && <span>已同步 {sync.last_result.starred_count.toLocaleString('zh-CN')} 个星标</span>}
           </div>
-          {syncFailure && <Notice>{syncFailure}</Notice>}
+          {syncFailure && (
+            <div className="settings-callout">
+              <Notice>{syncFailure}</Notice>
+              <button type="button" className="text-button" aria-haspopup="dialog" onClick={onOpenSettings}>打开 GitHub 设置</button>
+            </div>
+          )}
           <button type="button" className="button sync-button" disabled={!!running} onClick={() => void startSync()}>
             <ArrowDownUp size={15} /> {running ? '同步中…' : '同步星标'}
           </button>
