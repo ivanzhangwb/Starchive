@@ -569,7 +569,7 @@ fn nvm_bin_dirs(root: &Path, suffix: &str) -> Vec<PathBuf> {
             (parts.next().is_none()).then(|| (version, entry.path().join(suffix)))
         })
         .collect();
-    versions.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    versions.sort_unstable_by_key(|(version, _)| std::cmp::Reverse(*version));
     versions.into_iter().map(|(_, dir)| dir).collect()
 }
 
