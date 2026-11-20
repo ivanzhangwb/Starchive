@@ -134,6 +134,27 @@ fn automatic_retry_uses_final_message_without_appending_a_second_preview() -> Re
 }
 
 #[tokio::test]
+async fn repeated_progress_snapshots_do_not_exhaust_the_answer_limit() -> Result<()> {
+    use std::io::Write;
+    let dir = tempfile::tempdir()?;
+    let mut events = std::fs::File::create(dir.path().join("fixture-pi.events"))?;
+    let snapshot = json!({"type": "message_update", "message": {"role":"assistant", "content":[{"type":"text","text":"x".repeat(262_144)}]}}).to_string();
+    for _ in 0..65 {
+        writeln!(events, "{snapshot}")?;
+    }
+    let response = json!({"text":"Saved", "recommendations":[], "gaps":[]});
+    let end = json!({"type":"message_end", "message":{"role":"assistant", "stopReason":"stop", "content":[{"type":"text","text":response.to_string()}]}});
+    writeln!(events, "{end}")?;
+    let path = fixture(dir.path(), "cat >/dev/null && cat \"$0.events\"")?;
+    let agent = PiAgent::new(path).with_text_delta(|_| {});
+    assert_eq!(
+        agent.respond(&request("Find tools".into())).await?.text,
+        "Saved"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn streaming_mode_accepts_flat_fenced_response_without_replaying_final_text() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = fixture(

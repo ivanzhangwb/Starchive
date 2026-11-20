@@ -196,6 +196,7 @@ async fn read_output(
     if let Some(callback) = callback {
         let mut events = EventStream::default();
         let mut is_jsonl = false;
+        let mut delta_bytes = 0u64;
         let mut line = Vec::new();
         while stdout
             .read_until(b'\n', &mut line)
@@ -216,6 +217,17 @@ async fn read_output(
                 .filter(|event| event["type"].is_string())
             {
                 is_jsonl = true;
+                if let Some(delta) = event
+                    .get("assistantMessageEvent")
+                    .and_then(|update| update.get("delta"))
+                    .and_then(Value::as_str)
+                {
+                    delta_bytes += delta.len() as u64;
+                    ensure!(
+                        delta_bytes <= MAX_STDOUT,
+                        "Pi response exceeded the output limit. Retry the message"
+                    );
+                }
                 events.handle(event, callback);
             } else if is_jsonl {
                 bail!("Pi returned an invalid JSON event. Retry the message");
@@ -225,6 +237,11 @@ async fn read_output(
                 break;
             }
             line.clear();
+            if is_jsonl {
+                // Pi repeats the entire message-so-far in each event. Bound individual records
+                // and the actual deltas, without charging repeated snapshots to the answer.
+                stdout.set_limit(MAX_STDOUT + 1);
+            }
         }
         if is_jsonl {
             return Ok(Output::Events(events.completed));
