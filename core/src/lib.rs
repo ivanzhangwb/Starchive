@@ -5,5 +5,6 @@ pub mod runtime;
 pub mod settings;
 
 pub use library::{
-    Readme, RepoMetadata, RepoQuery, Repository, Store, SyncLease, SyncResult, SyncStatus,
+    Readme, RepoMetadata, RepoQuery, Repository, Store, SyncLease, SyncPhase, SyncProgress,
+    SyncResult, SyncStatus,
 };

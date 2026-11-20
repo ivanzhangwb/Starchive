@@ -78,9 +78,26 @@ pub struct SyncResult {
     pub unstarred: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncPhase {
+    Preparing,
+    Fetching,
+    Saving,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncProgress {
+    pub phase: SyncPhase,
+    pub pages: usize,
+    pub repositories: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncStatus {
     pub in_progress: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<SyncProgress>,
     pub last_attempt_at: Option<String>,
     pub last_successful_at: Option<String>,
     pub last_result: Option<SyncResult>,
@@ -90,6 +107,7 @@ pub struct SyncStatus {
 #[derive(FromRow)]
 struct SyncState {
     running: bool,
+    progress: Option<Json<SyncProgress>>,
     last_attempt_at: Option<String>,
     last_successful_at: Option<String>,
     last_result: Option<Json<SyncResult>>,
@@ -398,10 +416,15 @@ impl Store {
             return Ok(None);
         };
         sqlx::query(
-            "UPDATE library_sync_status SET running = TRUE,
+            "UPDATE library_sync_status SET running = TRUE, progress = ?,
                  last_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), last_error = NULL
              WHERE id = 1",
         )
+        .bind(Json(SyncProgress {
+            phase: SyncPhase::Preparing,
+            pages: 0,
+            repositories: 0,
+        }))
         .execute(&self.pool)
         .await
         .context("Record the start of GitHub sync")?;
@@ -432,6 +455,10 @@ impl Store {
         };
         Ok(SyncStatus {
             in_progress,
+            progress: state
+                .progress
+                .filter(|_| in_progress)
+                .map(|progress| progress.0),
             last_attempt_at: state.last_attempt_at,
             last_successful_at: state.last_successful_at,
             last_result: state.last_result.map(|result| result.0),
@@ -448,8 +475,34 @@ impl Store {
 }
 
 impl SyncLease {
+    pub(crate) async fn set_progress(
+        &self,
+        phase: SyncPhase,
+        pages: usize,
+        repositories: usize,
+    ) -> Result<()> {
+        sqlx::query("UPDATE library_sync_status SET progress = ? WHERE id = 1")
+            .bind(Json(SyncProgress {
+                phase,
+                pages,
+                repositories,
+            }))
+            .execute(&self.pool)
+            .await
+            .context("Record GitHub sync progress")?;
+        Ok(())
+    }
+
     pub async fn complete_snapshot(self, repositories: &[RepoMetadata]) -> Result<SyncResult> {
-        match self.apply_snapshot(repositories).await {
+        self.complete_fetched_snapshot(repositories, 0).await
+    }
+
+    pub(crate) async fn complete_fetched_snapshot(
+        self,
+        repositories: &[RepoMetadata],
+        pages: usize,
+    ) -> Result<SyncResult> {
+        match self.apply_snapshot(repositories, pages).await {
             Ok(result) => Ok(result),
             Err(error) => Err(self.fail(error).await),
         }
@@ -465,15 +518,24 @@ impl SyncLease {
     }
 
     pub async fn record_failure(self, error: &str) -> Result<()> {
-        sqlx::query("UPDATE library_sync_status SET running = FALSE, last_error = ? WHERE id = 1")
-            .bind(error)
-            .execute(&self.pool)
-            .await
-            .context("Record GitHub sync failure")?;
+        sqlx::query(
+            "UPDATE library_sync_status
+             SET running = FALSE, progress = NULL, last_error = ? WHERE id = 1",
+        )
+        .bind(error)
+        .execute(&self.pool)
+        .await
+        .context("Record GitHub sync failure")?;
         Ok(())
     }
 
-    async fn apply_snapshot(&self, repositories: &[RepoMetadata]) -> Result<SyncResult> {
+    async fn apply_snapshot(
+        &self,
+        repositories: &[RepoMetadata],
+        pages: usize,
+    ) -> Result<SyncResult> {
+        self.set_progress(SyncPhase::Saving, pages, repositories.len())
+            .await?;
         let ids: HashSet<_> = repositories.iter().map(|repo| repo.id).collect();
         ensure!(
             ids.len() == repositories.len(),
@@ -496,24 +558,36 @@ impl SyncLease {
         .execute(&mut *transaction)
         .await?;
 
-        for repo in repositories {
-            sqlx::query(
-                "INSERT INTO repositories (id, full_name, description, language, html_url, private, starred)
-                 VALUES (?, ?, ?, ?, ?, ?, TRUE)
-                 ON CONFLICT(id) DO UPDATE SET
+        // Six binds per row, below even SQLite's legacy 999-variable limit.
+        for batch in repositories.chunks(150) {
+            let mut upsert = QueryBuilder::<Sqlite>::new(
+                "INSERT INTO repositories (id, full_name, description, language, html_url, private, starred) ",
+            );
+            upsert.push_values(batch, |mut row, repo| {
+                row.push_bind(repo.id)
+                    .push_bind(&repo.full_name)
+                    .push_bind(&repo.description)
+                    .push_bind(&repo.language)
+                    .push_bind(&repo.html_url)
+                    .push_bind(repo.private)
+                    .push("TRUE");
+            });
+            upsert.push(
+                " ON CONFLICT(id) DO UPDATE SET
                      full_name = excluded.full_name, description = excluded.description,
                      language = excluded.language, html_url = excluded.html_url,
                      private = excluded.private, starred = TRUE",
-            )
-            .bind(repo.id)
-            .bind(&repo.full_name)
-            .bind(&repo.description)
-            .bind(&repo.language)
-            .bind(&repo.html_url)
-            .bind(repo.private)
-            .execute(&mut *transaction)
-            .await
-            .with_context(|| format!("Save GitHub repository {}", repo.id))?;
+            );
+            upsert
+                .build()
+                .execute(&mut *transaction)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Save GitHub repository batch starting at ID {}",
+                        batch[0].id
+                    )
+                })?;
         }
 
         let result = SyncResult {
@@ -522,7 +596,7 @@ impl SyncLease {
             unstarred: retired.rows_affected(),
         };
         sqlx::query(
-            "UPDATE library_sync_status SET running = FALSE,
+            "UPDATE library_sync_status SET running = FALSE, progress = NULL,
                  last_successful_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                  last_result = ?, last_error = NULL
              WHERE id = 1",

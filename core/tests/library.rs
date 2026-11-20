@@ -1,7 +1,7 @@
 use std::{io::Read, path::Path, process::Stdio, time::Duration};
 
 use anyhow::{bail, Context, Result};
-use starchive_core::{Readme, RepoMetadata, RepoQuery, Store, SyncResult};
+use starchive_core::{Readme, RepoMetadata, RepoQuery, Store, SyncPhase, SyncProgress, SyncResult};
 use tempfile::tempdir;
 use tokio::{io::AsyncBufReadExt, process::Command};
 
@@ -207,6 +207,59 @@ async fn search_composes_filters_and_edits_can_clear_individual_fields() -> Resu
 }
 
 #[tokio::test]
+async fn migrates_saved_library_and_sync_status_from_before_progress() -> Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("library.sqlite3");
+    let migrations = dir.path().join("old-migrations");
+    std::fs::create_dir(&migrations)?;
+    for (name, contents) in [
+        (
+            "0001_library.sql",
+            include_str!("../migrations/0001_library.sql"),
+        ),
+        (
+            "0002_conversations.sql",
+            include_str!("../migrations/0002_conversations.sql"),
+        ),
+    ] {
+        std::fs::write(migrations.join(name), contents)?;
+    }
+    let old_pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true),
+    )
+    .await?;
+    sqlx::migrate::Migrator::new(migrations)
+        .await?
+        .run(&old_pool)
+        .await?;
+    sqlx::raw_sql(
+        "INSERT INTO repositories (id, full_name, private, starred, html_url, note)
+             VALUES (1, 'fixture/saved', FALSE, TRUE, 'https://github.com/fixture/saved', 'My note');
+         UPDATE library_sync_status SET last_successful_at = '2026-07-04T09:00:00Z',
+             last_result = '{\"starred\":1,\"newly_starred\":1,\"unstarred\":0}' WHERE id = 1;",
+    )
+    .execute(&old_pool)
+    .await?;
+    old_pool.close().await;
+
+    let store = Store::open(&path).await?;
+    let saved = store.get_repository(1).await?.context("Saved repository")?;
+    assert!(saved.starred);
+    assert_eq!(saved.note, "My note");
+    let status = store.sync_status().await?;
+    assert!(!status.in_progress);
+    assert_eq!(status.progress, None);
+    assert_eq!(
+        status.last_successful_at.as_deref(),
+        Some("2026-07-04T09:00:00Z")
+    );
+    assert_eq!(status.last_result.unwrap().starred, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_and_storage_failures_preserve_last_success_and_allow_retry() -> Result<()> {
     let dir = tempdir()?;
     let store = Store::open(&dir.path().join("library.sqlite3")).await?;
@@ -222,6 +275,7 @@ async fn remote_and_storage_failures_preserve_last_success_and_allow_retry() -> 
     lease.record_failure("GitHub page 2 timed out").await?;
     let failed = store.sync_status().await?;
     assert!(!failed.in_progress);
+    assert_eq!(failed.progress, None);
     assert!(failed.last_attempt_at.is_some());
     assert_eq!(
         failed.last_error.as_deref(),
@@ -234,24 +288,26 @@ async fn remote_and_storage_failures_preserve_last_success_and_allow_retry() -> 
     assert_eq!(failed.last_result, original_status.last_result);
 
     let transient = repo(2, "example/new");
-    let invalid = repo(0, "example/invalid");
-    let failure = sync(&store, &[transient.clone(), invalid])
-        .await
-        .unwrap_err();
-    assert!(
-        failure.to_string().contains("Save GitHub repository 0"),
-        "{failure:#}"
+    let mut snapshot: Vec<_> = (2..=301)
+        .map(|id| repo(id, &format!("example/repo-{id}")))
+        .collect();
+    snapshot.push(repo(0, "example/invalid"));
+    let failure = sync(&store, &snapshot).await.unwrap_err();
+    assert!(format!("{failure:#}").contains("CHECK constraint failed: id > 0"));
+    assert_eq!(
+        store.list_repositories(&RepoQuery::default()).await?.len(),
+        1
     );
-    assert!(store.get_repository(2).await?.is_none());
     let previous = store.get_repository(original.id).await?.unwrap();
     assert_eq!(previous.metadata, original);
     assert!(previous.starred);
     let failed_write = store.sync_status().await?;
     assert!(!failed_write.in_progress);
+    assert_eq!(failed_write.progress, None);
     assert!(failed_write
         .last_error
         .unwrap()
-        .contains("Save GitHub repository 0"));
+        .contains("CHECK constraint failed: id > 0"));
     assert_eq!(
         failed_write.last_successful_at,
         original_status.last_successful_at
@@ -261,6 +317,7 @@ async fn remote_and_storage_failures_preserve_last_success_and_allow_retry() -> 
     let result = sync(&store, &[transient]).await?;
     let retried = store.sync_status().await?;
     assert!(!retried.in_progress);
+    assert_eq!(retried.progress, None);
     assert!(retried.last_error.is_none());
     assert_eq!(retried.last_result, Some(result));
     Ok(())
@@ -353,7 +410,16 @@ async fn separate_process_can_edit_while_syncing_and_a_crash_releases_the_lease(
     })
     .await??;
 
-    assert!(store.sync_status().await?.in_progress);
+    let active = store.sync_status().await?;
+    assert!(active.in_progress);
+    assert_eq!(
+        active.progress,
+        Some(SyncProgress {
+            phase: SyncPhase::Preparing,
+            pages: 0,
+            repositories: 0,
+        })
+    );
     assert!(second.try_sync_lease().await?.is_none());
     assert_eq!(
         store.get_repository(1).await?.unwrap().note,
@@ -366,6 +432,7 @@ async fn separate_process_can_edit_while_syncing_and_a_crash_releases_the_lease(
 
     let interrupted = store.sync_status().await?;
     assert!(!interrupted.in_progress);
+    assert_eq!(interrupted.progress, None);
     assert!(interrupted.last_error.unwrap().contains("interrupted"));
     let result = sync(&second, &[original]).await?;
     assert_eq!(result.newly_starred, 0);

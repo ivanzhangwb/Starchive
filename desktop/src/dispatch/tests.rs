@@ -64,9 +64,27 @@ async fn lists_and_edits_the_shared_library_with_lossless_ids() -> Result<()> {
         .await?
         .is_null());
     let status = app.dispatch("sync_status", json!({})).await?;
+    assert_eq!(status["running"], false);
+    assert!(status.get("progress").is_none());
     assert_eq!(
         status["last_result"],
         json!({"state": "success", "starred_count": 2})
+    );
+    let lease = store.try_sync_lease().await?.unwrap();
+    let preparing = app.dispatch("sync_status", json!({})).await?;
+    assert_eq!(preparing["running"], true);
+    assert_eq!(
+        preparing["progress"],
+        json!({"phase": "preparing", "pages": 0, "repositories": 0})
+    );
+    assert_eq!(preparing["last_success_at"], status["last_success_at"]);
+    lease.record_failure("GitHub page 2 timed out").await?;
+    let failed = app.dispatch("sync_status", json!({})).await?;
+    assert_eq!(failed["running"], false);
+    assert!(failed.get("progress").is_none());
+    assert_eq!(
+        failed["last_result"],
+        json!({"state": "error", "message": "GitHub page 2 timed out"})
     );
     assert!(app
         .dispatch(

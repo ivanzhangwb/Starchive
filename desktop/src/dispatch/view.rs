@@ -73,7 +73,15 @@ pub fn sync_status(status: SyncStatus) -> Value {
             .last_result
             .map(|result| json!({"state": "success", "starred_count": result.starred})))
     };
-    json!({"running": status.in_progress, "last_success_at": status.last_successful_at, "last_result": last_result})
+    let mut response = json!({
+        "running": status.in_progress,
+        "last_success_at": status.last_successful_at,
+        "last_result": last_result,
+    });
+    if let Some(progress) = status.progress {
+        response["progress"] = json!(progress);
+    }
+    response
 }
 
 pub fn session_summary(session: &agent::SessionSummary) -> Value {

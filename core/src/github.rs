@@ -1,10 +1,14 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    future::{ready, Future},
+    time::Duration,
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{redirect::Policy, Client, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 
-use crate::{settings, Readme, RepoMetadata, Store, SyncLease, SyncResult};
+use crate::{settings, Readme, RepoMetadata, Store, SyncLease, SyncPhase, SyncResult};
 
 const API_URL: &str = "https://api.github.com/";
 pub(crate) const TOKEN_ENV: &str = "STARCHIVE_GITHUB_TOKEN";
@@ -101,8 +105,11 @@ impl GitHub {
     }
 
     pub(crate) async fn from_settings() -> anyhow::Result<Self> {
-        let token = tokio::task::spawn_blocking(settings::github_token).await??;
-        Ok(Self::new(token.as_deref())?)
+        tokio::task::spawn_blocking(|| {
+            let token = settings::github_token()?;
+            Ok(Self::new(token.as_deref())?)
+        })
+        .await?
     }
 
     fn with_base_url(base: &str, token: Option<&str>) -> Result<Self, GitHubError> {
@@ -155,23 +162,40 @@ impl GitHub {
     }
 
     async fn sync_with_lease(&self, lease: SyncLease) -> anyhow::Result<SyncResult> {
-        match self.starred().await {
-            Ok(stars) => {
+        let fetched = self
+            .starred_with_progress(|pages, repositories| {
+                lease.set_progress(SyncPhase::Fetching, pages, repositories)
+            })
+            .await;
+        match fetched {
+            Ok((stars, pages)) => {
                 let repositories: Vec<_> = stars.into_iter().map(RepoMetadata::from).collect();
-                lease.complete_snapshot(&repositories).await
+                lease.complete_fetched_snapshot(&repositories, pages).await
             }
-            Err(error) => Err(lease.fail(error.into()).await),
+            Err(error) => Err(lease.fail(error).await),
         }
     }
 
     /// Fetch the entire authenticated star list before returning a snapshot.
     pub async fn starred(&self) -> Result<Vec<GitHubRepo>, GitHubError> {
+        let (repositories, _) = self.starred_with_progress(|_, _| ready(Ok(()))).await?;
+        Ok(repositories)
+    }
+
+    async fn starred_with_progress<
+        E: From<GitHubError>,
+        F: Future<Output = Result<(), E>> + Send,
+    >(
+        &self,
+        mut report: impl FnMut(usize, usize) -> F,
+    ) -> Result<(Vec<GitHubRepo>, usize), E> {
         #[derive(Deserialize)]
         struct Star {
             starred_at: String,
             repo: GitHubRepo,
         }
 
+        report(0, 0).await?;
         let token = self.token.as_ref().ok_or(GitHubError::Configuration(
             "Configure a GitHub credential with read access to your stars in Settings, with gh auth login, or with GH_TOKEN",
         ))?;
@@ -181,9 +205,10 @@ impl GitHub {
 
         let mut visited = HashSet::new();
         let mut repositories = Vec::new();
+        let mut pages = 0;
         loop {
             if !visited.insert(url.clone()) {
-                return Err(GitHubError::InvalidPagination);
+                return Err(GitHubError::InvalidPagination.into());
             }
             let response = self
                 .get(url.clone(), "application/vnd.github.star+json", Some(token))
@@ -197,9 +222,11 @@ impl GitHub {
                     ..star.repo
                 });
             }
+            pages += 1;
+            report(pages, repositories.len()).await?;
             match next {
                 Some(next) => url = next,
-                None => return Ok(repositories),
+                None => return Ok((repositories, pages)),
             }
         }
     }
@@ -487,12 +514,17 @@ impl GitHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Store;
+    use crate::SyncProgress;
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     struct Server(TcpListener);
+
+    struct PendingRequest {
+        stream: BufReader<TcpStream>,
+        request: String,
+    }
 
     impl Server {
         async fn start() -> Self {
@@ -503,7 +535,7 @@ mod tests {
             format!("http://{}/", self.0.local_addr().unwrap())
         }
 
-        async fn reply(&self, status: u16, headers: &str, body: &str) -> String {
+        async fn accept(&self) -> PendingRequest {
             let (stream, _) = tokio::time::timeout(Duration::from_secs(5), self.0.accept())
                 .await
                 .expect("expected a GitHub API request")
@@ -518,12 +550,22 @@ mod tests {
                 }
                 request.push_str(&line);
             }
+            PendingRequest { stream, request }
+        }
+
+        async fn reply(&self, status: u16, headers: &str, body: &str) -> String {
+            self.accept().await.respond(status, headers, body).await
+        }
+    }
+
+    impl PendingRequest {
+        async fn respond(mut self, status: u16, headers: &str, body: &str) -> String {
             let response = format!(
                 "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
                 body.len()
             );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            request
+            self.stream.write_all(response.as_bytes()).await.unwrap();
+            self.request
         }
     }
 
@@ -675,11 +717,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_pagination_preserves_the_library_and_retry_applies_the_whole_snapshot() {
+    async fn slow_pagination_reports_progress_preserves_the_library_and_retries_atomically() {
         let temp = tempfile::tempdir().unwrap();
-        let store = Store::open(&temp.path().join("library.sqlite"))
-            .await
-            .unwrap();
+        let path = temp.path().join("library.sqlite");
+        let store = Store::open(&path).await.unwrap();
+        let observer = Store::open(&path).await.unwrap();
         let server = Server::start().await;
         let client = GitHub::with_base_url(&server.url(), Some("example-token")).unwrap();
         let original = json!([star(1, "acme/old-name"), star(2, "acme/retired")]).to_string();
@@ -690,43 +732,96 @@ mod tests {
             .edit_repository(1, Some("Works offline"), Some(&tags))
             .await
             .unwrap();
-        let last_successful = store
-            .sync_status()
+        let previous = observer
+            .list_repositories(&Default::default())
             .await
-            .unwrap()
-            .last_successful_at
             .unwrap();
+        let last_successful = observer.sync_status().await.unwrap().last_successful_at;
         let rename = json!([star(1, "acme/new-name")]).to_string();
         let more = "Link: <?page=2>; rel=\"next\"\r\n";
+        let fetching = |pages, repositories| {
+            Some(SyncProgress {
+                phase: SyncPhase::Fetching,
+                pages,
+                repositories,
+            })
+        };
 
         let (result, ()) = tokio::join!(client.sync(&store), async {
-            server.reply(200, more, &rename).await;
-            server.reply(502, "", "{}").await;
+            let first = server.accept().await;
+            assert_eq!(
+                observer.sync_status().await.unwrap().progress,
+                fetching(0, 0)
+            );
+            first.respond(200, more, &rename).await;
+
+            let second = server.accept().await;
+            let status = observer.sync_status().await.unwrap();
+            assert!(status.in_progress);
+            assert_eq!(status.progress, fetching(1, 1));
+            assert_eq!(status.last_successful_at, last_successful);
+            assert_eq!(
+                observer
+                    .list_repositories(&Default::default())
+                    .await
+                    .unwrap(),
+                previous
+            );
+            second.respond(502, "", "{}").await;
         });
         assert!(result.unwrap_err().to_string().contains("502"));
-        let status = store.sync_status().await.unwrap();
-        assert_eq!(
-            status.last_successful_at.as_deref(),
-            Some(last_successful.as_str())
-        );
+        let status = observer.sync_status().await.unwrap();
+        assert!(!status.in_progress);
+        assert_eq!(status.progress, None);
+        assert_eq!(status.last_successful_at, last_successful);
         assert_eq!(status.last_result.unwrap().starred, 2);
         assert!(status.last_error.unwrap().contains("502"));
         assert_eq!(
-            store
-                .get_repository(1)
+            observer
+                .list_repositories(&Default::default())
                 .await
-                .unwrap()
-                .unwrap()
-                .metadata
-                .full_name,
-            "acme/old-name"
+                .unwrap(),
+            previous
         );
-        assert!(store.get_repository(2).await.unwrap().unwrap().starred);
 
+        sqlx::query(
+            "CREATE TRIGGER verify_saving BEFORE INSERT ON repositories
+             BEGIN
+                 SELECT RAISE(ABORT, 'missing saving progress') WHERE NOT EXISTS (
+                     SELECT 1 FROM library_sync_status WHERE running
+                       AND json_extract(progress, '$.phase') = 'saving'
+                       AND json_extract(progress, '$.pages') = 3
+                       AND json_extract(progress, '$.repositories') = 2
+                 );
+             END",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
         let (result, ()) = tokio::join!(client.sync(&store), async {
-            server.reply(200, more, &rename).await;
+            let first = server.accept().await;
+            let status = observer.sync_status().await.unwrap();
+            assert_eq!(status.progress, fetching(0, 0));
+            assert!(status.last_error.is_none());
+            first.respond(200, more, &rename).await;
             server
-                .reply(200, "", &json!([star(3, "acme/new-star")]).to_string())
+                .reply(200, "Link: <?page=3>; rel=\"next\"\r\n", "[]")
+                .await;
+
+            let third = server.accept().await;
+            assert_eq!(
+                observer.sync_status().await.unwrap().progress,
+                fetching(2, 1)
+            );
+            assert_eq!(
+                observer
+                    .list_repositories(&Default::default())
+                    .await
+                    .unwrap(),
+                previous
+            );
+            third
+                .respond(200, "", &json!([star(3, "acme/new-star")]).to_string())
                 .await;
         });
         let summary = result.unwrap();
@@ -734,8 +829,12 @@ mod tests {
             (summary.starred, summary.newly_starred, summary.unstarred),
             (2, 1, 1)
         );
-        assert!(store.sync_status().await.unwrap().last_error.is_none());
-        let renamed = store.get_repository(1).await.unwrap().unwrap();
+        let status = observer.sync_status().await.unwrap();
+        assert!(!status.in_progress);
+        assert_eq!(status.progress, None);
+        assert!(status.last_error.is_none());
+        assert_eq!(status.last_result, Some(summary));
+        let renamed = observer.get_repository(1).await.unwrap().unwrap();
         assert_eq!(renamed.metadata.full_name, "acme/new-name");
         assert_eq!(renamed.note, "Works offline");
         assert_eq!(renamed.tags, tags);
