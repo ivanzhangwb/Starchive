@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{redirect::Policy, Client, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 
-use crate::{Readme, RepoMetadata, Store, SyncLease, SyncResult};
+use crate::{settings, Readme, RepoMetadata, Store, SyncLease, SyncResult};
 
 const API_URL: &str = "https://api.github.com/";
 pub(crate) const TOKEN_ENV: &str = "STARCHIVE_GITHUB_TOKEN";
@@ -31,7 +31,7 @@ impl std::fmt::Display for GitHubError {
         match self {
             Self::Configuration(message) => f.write_str(message),
             Self::Transport(error) => write!(f, "GitHub request failed: {error}"),
-            Self::Unauthorized => f.write_str("GitHub rejected authentication (HTTP 401). Check or replace STARCHIVE_GITHUB_TOKEN."),
+            Self::Unauthorized => f.write_str("GitHub rejected authentication (HTTP 401). Check the credential source in Settings or update your GitHub CLI login or environment token."),
             Self::Forbidden => f.write_str("GitHub denied access (HTTP 403). Check the credential's read permissions and repository access."),
             Self::RateLimited { retry_after: Some(seconds), .. } => {
                 write!(f, "GitHub rate limit reached. Retry after {seconds} seconds.")
@@ -100,14 +100,9 @@ impl GitHub {
         Self::with_base_url(API_URL, token)
     }
 
-    pub fn from_env() -> Result<Self, GitHubError> {
-        match std::env::var(TOKEN_ENV) {
-            Ok(token) => Self::new(Some(&token)),
-            Err(std::env::VarError::NotPresent) => Self::new(None),
-            Err(std::env::VarError::NotUnicode(_)) => Err(GitHubError::Configuration(
-                "STARCHIVE_GITHUB_TOKEN must be valid text",
-            )),
-        }
+    pub(crate) async fn from_settings() -> anyhow::Result<Self> {
+        let token = tokio::task::spawn_blocking(settings::github_token).await??;
+        Ok(Self::new(token.as_deref())?)
     }
 
     fn with_base_url(base: &str, token: Option<&str>) -> Result<Self, GitHubError> {
@@ -124,17 +119,13 @@ impl GitHub {
         let token = token.map(str::trim).filter(|token| !token.is_empty());
         let token = token
             .map(|token| {
+                let invalid_token =
+                    GitHubError::Configuration("The GitHub credential contains invalid characters");
                 if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
-                    return Err(GitHubError::Configuration(
-                        "STARCHIVE_GITHUB_TOKEN contains invalid characters",
-                    ));
+                    return Err(invalid_token);
                 }
                 let mut header = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-                    .map_err(|_| {
-                        GitHubError::Configuration(
-                            "STARCHIVE_GITHUB_TOKEN contains invalid characters",
-                        )
-                    })?;
+                    .map_err(|_| invalid_token)?;
                 header.set_sensitive(true);
                 Ok(header)
             })
@@ -143,12 +134,12 @@ impl GitHub {
         Ok(Self { http, base, token })
     }
 
-    /// Record the attempt before reading configuration so setup failures are visible on reopen.
-    pub async fn sync_from_env(store: &Store) -> anyhow::Result<SyncResult> {
+    /// Record the attempt before discovering credentials so setup failures are visible on reopen.
+    pub async fn sync_from_settings(store: &Store) -> anyhow::Result<SyncResult> {
         let lease = Self::sync_lease(store).await?;
-        match Self::from_env() {
+        match Self::from_settings().await {
             Ok(client) => client.sync_with_lease(lease).await,
-            Err(error) => Err(lease.fail(error.into()).await),
+            Err(error) => Err(lease.fail(error).await),
         }
     }
 
@@ -182,7 +173,7 @@ impl GitHub {
         }
 
         let token = self.token.as_ref().ok_or(GitHubError::Configuration(
-            "Set STARCHIVE_GITHUB_TOKEN to a GitHub credential with read access to your stars",
+            "Configure a GitHub credential with read access to your stars in Settings, with gh auth login, or with GH_TOKEN",
         ))?;
         let endpoint = self.base.join("user/starred").expect("valid API endpoint");
         let mut url = endpoint.clone();
@@ -258,7 +249,7 @@ impl GitHub {
     ) -> anyhow::Result<Option<Readme>> {
         let token = if repo.private {
             Some(self.token.as_ref().ok_or(GitHubError::Configuration(
-                "Set STARCHIVE_GITHUB_TOKEN to a GitHub credential with read access to this private repository's contents",
+                "Configure a GitHub credential with read access to this private repository's contents in Settings, with gh auth login, or with GH_TOKEN",
             ))?)
         } else {
             None
@@ -628,7 +619,7 @@ mod tests {
         let server = Server::start().await;
         let client = GitHub::with_base_url(&server.url(), Some("example-token")).unwrap();
         for (status, headers, body, message) in [
-            (401, "", "{}", "Check or replace STARCHIVE_GITHUB_TOKEN"),
+            (401, "", "{}", "Check the credential source in Settings"),
             (403, "", "{}", "Check the credential's read permissions"),
             (403, "Retry-After: 60\r\n", "{}", "Retry after 60 seconds"),
             (

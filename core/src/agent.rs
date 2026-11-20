@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use crate::Store;
+use crate::{settings, Store};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -128,6 +128,8 @@ impl PiAgent {
 impl Agent for PiAgent {
     async fn respond(&self, request: &AgentRequest) -> Result<AgentResponse> {
         let input = serde_json::to_vec(request)?;
+        let executable = self.executable.clone();
+        let path = tokio::task::spawn_blocking(move || settings::child_path(&executable)).await?;
         let mut child = Command::new(&self.executable)
             .args([
                 "--print",
@@ -146,6 +148,9 @@ impl Agent for PiAgent {
                 "--system-prompt",
                 PI_SYSTEM_PROMPT,
             ])
+            .env("PATH", path)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
             .env_remove(crate::github::TOKEN_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -155,12 +160,12 @@ impl Agent for PiAgent {
             .map_err(|error| {
                 if error.kind() == ErrorKind::NotFound {
                     return anyhow::anyhow!(
-                        "Cannot find {}. Install pi or configure its executable path",
+                        "Cannot find {}. Install pi or set its executable path in Settings",
                         self.executable.display()
                     );
                 }
                 anyhow::anyhow!(
-                    "Cannot start {}: {error}. Check its executable path and permissions",
+                    "Cannot start {}: {error}. Check its executable path in Settings and its permissions",
                     self.executable.display()
                 )
             })?;
@@ -1365,17 +1370,21 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn pi_subprocess_does_not_inherit_the_github_token() -> Result<()> {
+    async fn pi_subprocess_uses_augmented_path_without_github_tokens() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("pi");
+        let helper = temp.path().join("starchive-test-pi-path-helper");
+        std::fs::write(&helper, "#!/bin/sh\n")?;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
         std::fs::write(
             &path,
             r#"#!/bin/sh
 cat >/dev/null
-[ "${STARCHIVE_GITHUB_TOKEN+x}" = "" ] || exit 6
-printf '%s\n' '{"text":"The credential is absent","recommendations":[],"gaps":[]}'
+command -v starchive-test-pi-path-helper >/dev/null || exit 5
+[ "${GH_TOKEN+x}${GITHUB_TOKEN+x}${STARCHIVE_GITHUB_TOKEN+x}" = "" ] || exit 6
+printf '%s\n' '{"text":"The credentials are absent","recommendations":[],"gaps":[]}'
 "#,
         )?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
@@ -1384,10 +1393,13 @@ printf '%s\n' '{"text":"The credential is absent","recommendations":[],"gaps":[]
             let output = std::process::Command::new(std::env::current_exe()?)
                 .args([
                     "--exact",
-                    "agent::tests::pi_subprocess_does_not_inherit_the_github_token",
+                    "agent::tests::pi_subprocess_uses_augmented_path_without_github_tokens",
                 ])
+                .env("PATH", "/usr/bin:/bin")
                 .env("STARCHIVE_PI_ENV_TEST", "1")
-                .env("STARCHIVE_GITHUB_TOKEN", "fake-github-token-sentinel")
+                .env("GH_TOKEN", "fake-gh-token-sentinel")
+                .env("GITHUB_TOKEN", "fake-github-token-sentinel")
+                .env("STARCHIVE_GITHUB_TOKEN", "fake-legacy-token-sentinel")
                 .output()?;
             ensure!(
                 output.status.success(),
@@ -1405,7 +1417,7 @@ printf '%s\n' '{"text":"The credential is absent","recommendations":[],"gaps":[]
         };
         assert_eq!(
             PiAgent::new(path).respond(&request).await?.text,
-            "The credential is absent"
+            "The credentials are absent"
         );
         Ok(())
     }

@@ -24,8 +24,7 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             let path = runtime::database_path()?;
-            let desktop =
-                tauri::async_runtime::block_on(Desktop::open(&path, runtime::pi_executable()))?;
+            let desktop = tauri::async_runtime::block_on(Desktop::open(&path))?;
             app.manage(desktop);
             Ok(())
         })

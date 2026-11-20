@@ -22,8 +22,9 @@ npm --prefix desktop run build
 ## 数据和账户
 
 - 默认数据库位于操作系统的本机应用数据目录，文件名为 `Starchive/library.sqlite3`。macOS 上为 `~/Library/Application Support/Starchive/library.sqlite3`。设置 `STARCHIVE_DB_PATH` 可让两个入口使用同一个指定文件。CLI 也可用 `--db FILE` 单独指定路径。
-- 设置 `STARCHIVE_GITHUB_TOKEN` 后启动桌面端或运行 `starchive sync`。GitHub 细粒度令牌需要 Starring 读取权限。获取私有仓库 README 还需要该仓库的 Contents 读取权限。公开 README 和公开搜索使用匿名请求。
-- 桌面端使用 `PATH` 上的 `pi`，也可以设置 `STARCHIVE_PI_PATH` 指向可执行文件。先在 pi 中配置模型并确认可用。使用终端设置环境变量时，从仓库根目录运行 `npm --prefix desktop run dev`，或在同一终端运行 `"${CARGO_TARGET_DIR:-target}/release/bundle/macos/Starchive.app/Contents/MacOS/starchive-desktop"`（macOS），让应用继承配置。
+- 桌面端「设置」会显示当前检测到的 GitHub 凭据来源与 pi 路径。离线打开资料库无需登录 GitHub 或安装 pi。
+- 同步星标前，可在终端运行 `gh auth login --hostname github.com`，也可在桌面端「设置」粘贴个人访问令牌。保存的令牌存入操作系统的凭据存储，桌面端和 `starchive sync` 共用。凭据优先级依次为设置中保存的令牌、`GH_TOKEN`、`GITHUB_TOKEN`、`STARCHIVE_GITHUB_TOKEN`、GitHub CLI 中 `github.com` 的登录凭据。GitHub 细粒度令牌需要 Starring 读取权限。获取私有仓库 README 还需要该仓库的 Contents 读取权限。公开 README 和公开搜索使用匿名请求。
+- 先安装 pi，在 pi 中配置模型并确认可用。桌面端依次查找设置中保存的可执行文件、`STARCHIVE_PI_PATH` 指定的可执行文件、`PATH` 和 Homebrew、npm、nvm、`~/.pi/agent/bin` 等常见安装位置。保存或清除路径后，下一条消息立即使用当前配置。从 macOS Finder 启动时也可使用自动检测或保存的路径。使用仅在终端中设置的环境变量时，请从同一终端启动桌面应用或运行 CLI。
 
 ## CLI
 

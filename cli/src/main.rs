@@ -93,7 +93,7 @@ async fn run(cli: Cli) -> Result<()> {
     let store = Store::open(&path).await?;
     match cli.command {
         Action::Sync => {
-            let result = GitHub::sync_from_env(&store).await?;
+            let result = GitHub::sync_from_settings(&store).await?;
             if cli.json {
                 print_json(&result)?;
             } else {

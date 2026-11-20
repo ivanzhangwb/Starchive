@@ -18,6 +18,8 @@ fn cli(db: &Path, args: &[&str]) -> Result<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+// Override the home directory to isolate the CLI from saved credentials.
+#[cfg(unix)]
 #[tokio::test]
 async fn malformed_credentials_record_a_failed_sync_and_preserve_the_last_success() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -35,6 +37,10 @@ async fn malformed_credentials_record_a_failed_sync_and_preserve_the_last_succes
         .arg("--db")
         .arg(&db)
         .arg("sync")
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
         .env("STARCHIVE_GITHUB_TOKEN", "malformed credential sentinel")
         .output()?;
     assert!(!failure.status.success());

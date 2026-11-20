@@ -40,7 +40,7 @@ async fn lists_and_edits_the_shared_library_with_lossless_ids() -> Result<()> {
             },
         )
         .await?;
-    let app = Desktop::open(&path, dir.path().join("missing pi")).await?;
+    let app = Desktop::open(&path).await?;
     let id = large_id.to_string();
     let updated = app
         .dispatch(
@@ -63,10 +63,6 @@ async fn lists_and_edits_the_shared_library_with_lossless_ids() -> Result<()> {
         .dispatch("repo_get", json!({"repo_id": "999"}))
         .await?
         .is_null());
-    assert_eq!(
-        app.dispatch("agent_list", json!({})).await?[0]["available"],
-        false
-    );
     let status = app.dispatch("sync_status", json!({})).await?;
     assert_eq!(
         status["last_result"],
@@ -93,7 +89,7 @@ async fn desktop_patches_only_dirty_fields_and_rejects_stale_fields_atomically()
         .unwrap()
         .complete_snapshot(&[repo(1, "fixture/edit", false)])
         .await?;
-    let desktop = Desktop::open(&path, dir.path().join("missing pi")).await?;
+    let desktop = Desktop::open(&path).await?;
 
     cli_store
         .edit_repository(1, Some("new CLI note"), None)
@@ -136,7 +132,7 @@ async fn desktop_patches_only_dirty_fields_and_rejects_stale_fields_atomically()
     assert_eq!(cleared["repo"]["note"], "");
     assert_eq!(cleared["repo"]["tags"], json!([]));
 
-    let other = Desktop::open(&path, dir.path().join("missing pi")).await?;
+    let other = Desktop::open(&path).await?;
     let (first, second) = tokio::join!(
         desktop.dispatch(
             "repo_update",
@@ -207,7 +203,7 @@ async fn reopens_session_candidates_with_offline_readmes_only_in_their_own_sessi
         .await?;
     store.pool().close().await;
 
-    let app = Desktop::open(&path, dir.path().join("missing pi")).await?;
+    let app = Desktop::open(&path).await?;
     let id = session.id.to_string();
     let session = app
         .dispatch("session_get", json!({"session_id": id}))
@@ -237,9 +233,30 @@ async fn reopens_session_candidates_with_offline_readmes_only_in_their_own_sessi
 #[cfg(unix)]
 #[tokio::test]
 async fn restored_history_stays_local_after_revoking_context() -> Result<()> {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{env, fs, os::unix::fs::PermissionsExt, process::Command};
 
     let dir = tempfile::tempdir()?;
+    // Run settings writes against a temporary home without changing other tests' environment.
+    if env::var_os("STARCHIVE_DESKTOP_SETTINGS_TEST").is_none() {
+        let output = Command::new(env::current_exe()?)
+            .args([
+                "--exact",
+                "dispatch::tests::restored_history_stays_local_after_revoking_context",
+            ])
+            .env("STARCHIVE_DESKTOP_SETTINGS_TEST", "1")
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path())
+            .env("GH_TOKEN", "synthetic-settings-token")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return Ok(());
+    }
+
     let path = dir.path().join("library.sqlite3");
     let pi = dir.path().join("test pi");
     let request_path = dir.path().join("test pi.request");
@@ -281,7 +298,38 @@ fi
         )
         .await?;
 
-    let app = Desktop::open(&path, pi.clone()).await?;
+    let app = Desktop::open(&path).await?;
+    let status = app
+        .dispatch("settings_save_pi", json!({"path": pi}))
+        .await?;
+    assert_eq!(
+        status["github"],
+        json!({"available": true, "source": "environment"})
+    );
+    assert!(!status.to_string().contains("synthetic-settings-token"));
+    assert_eq!(
+        status["pi"],
+        json!({"available": true, "source": "saved", "path": pi})
+    );
+    assert_eq!(app.dispatch("settings_get", json!({})).await?, status);
+    let error = app
+        .dispatch("settings_save_github", json!({"token": "invalid sentinel"}))
+        .await
+        .unwrap_err();
+    assert!(!format!("{error:#}").contains("sentinel"));
+    assert!(app
+        .dispatch("settings_save_github", json!({}))
+        .await
+        .is_err());
+    assert_eq!(
+        app.dispatch("settings_save_github", json!({"token": null}))
+            .await?,
+        status
+    );
+    assert_eq!(
+        app.dispatch("agent_list", json!({})).await?[0]["available"],
+        true
+    );
     let created = app
         .dispatch("session_create", json!({"agent_id": null}))
         .await?;
@@ -332,7 +380,7 @@ fi
         .complete_snapshot(&[public])
         .await?;
 
-    let app = Desktop::open(&path, pi).await?;
+    let app = Desktop::open(&path).await?;
     let restored = app
         .dispatch("session_get", json!({"session_id": id}))
         .await?;
@@ -341,6 +389,12 @@ fi
     assert_eq!(old_reply["text"], "synthetic-assistant-sentinel");
     assert_eq!(old_reply["candidates"][0]["repo"]["starred"], false);
     assert!(old_reply["candidates"][0]["repo"].get("note").is_none());
+    let next_pi = dir.path().join("replacement pi");
+    fs::copy(&pi, &next_pi)?;
+    let status = app
+        .dispatch("settings_save_pi", json!({"path": next_pi}))
+        .await?;
+    assert_eq!(status["pi"]["path"], json!(next_pi));
     let followup = app
         .dispatch(
             "agent_send",
@@ -348,10 +402,15 @@ fi
         )
         .await?;
     assert_eq!(followup["messages"][3]["text"], "Public follow-up");
-    let request = fs::read_to_string(request_path)?;
+    let request = fs::read_to_string(dir.path().join("replacement pi.request"))?;
     assert!(request.contains("fixture/public"));
     assert!(request.contains("First request"));
     assert!(!request.contains("fixture/private"));
     assert!(!request.contains("sentinel"));
+    assert!(app.dispatch("settings_save_pi", json!({})).await.is_err());
+    let cleared = app
+        .dispatch("settings_save_pi", json!({"path": null}))
+        .await?;
+    assert_ne!(cleared["pi"]["source"], "saved");
     Ok(())
 }

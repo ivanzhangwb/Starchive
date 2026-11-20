@@ -23,17 +23,11 @@ pub fn database_path() -> Result<PathBuf> {
 
 pub async fn refresh_readme(store: &Store, repo: &RepoMetadata) -> Result<Option<Readme>> {
     let github = if repo.private {
-        GitHub::from_env()?
+        GitHub::from_settings().await?
     } else {
         GitHub::new(None)?
     };
     github.refresh_readme(store, repo).await
-}
-
-pub fn pi_executable() -> PathBuf {
-    env::var_os("STARCHIVE_PI_PATH")
-        .filter(|path| !path.is_empty())
-        .map_or_else(|| PathBuf::from("pi"), PathBuf::from)
 }
 
 pub fn find_executable(path: &Path) -> Option<PathBuf> {

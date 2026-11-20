@@ -8,7 +8,7 @@ use starchive_core::{
     github::GitHub,
     library::{FieldEdit, PatchResult},
     runtime::{self, AgentLibrary},
-    RepoQuery, Store,
+    settings, RepoQuery, Store,
 };
 
 mod view;
@@ -62,6 +62,15 @@ enum Action {
     },
     SyncStatus {},
     SyncStart {},
+    SettingsGet {},
+    SettingsSaveGithub {
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        token: Option<String>,
+    },
+    SettingsSavePi {
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        path: Option<String>,
+    },
     AgentList {},
     SessionList {},
     SessionCreate {
@@ -102,17 +111,15 @@ const PI_ID: &str = "pi";
 pub struct Desktop {
     store: Store,
     conversations: Conversations,
-    pi_path: PathBuf,
 }
 
 impl Desktop {
-    pub async fn open(path: &Path, pi_path: PathBuf) -> Result<Self> {
+    pub async fn open(path: &Path) -> Result<Self> {
         let store = Store::open(path).await?;
         let conversations = Conversations::new(&store);
         Ok(Self {
             store,
             conversations,
-            pi_path,
         })
     }
 
@@ -193,11 +200,26 @@ impl Desktop {
             }
             Action::SyncStatus {} => Ok(view::sync_status(store.sync_status().await?)),
             Action::SyncStart {} => {
-                GitHub::sync_from_env(store).await?;
+                GitHub::sync_from_settings(store).await?;
                 Ok(view::sync_status(store.sync_status().await?))
             }
+            Action::SettingsGet {} => settings_status(settings::status).await,
+            Action::SettingsSaveGithub { token } => {
+                settings_status(move || {
+                    settings::save_github(token.as_deref())?;
+                    settings::status()
+                })
+                .await
+            }
+            Action::SettingsSavePi { path } => {
+                settings_status(move || {
+                    settings::save_pi(path.as_deref())?;
+                    settings::status()
+                })
+                .await
+            }
             Action::AgentList {} => Ok(json!([{
-                "id": PI_ID, "name": "pi", "available": runtime::find_executable(&self.pi_path).is_some(),
+                "id": PI_ID, "name": "pi", "available": current_pi_path().await?.is_some(),
             }])),
             Action::SessionList {} => Ok(json!(sessions
                 .list()
@@ -265,8 +287,9 @@ impl Desktop {
                         .as_deref()
                         .context("Choose a local agent first")?,
                 )?;
-                let executable =
-                    runtime::find_executable(&self.pi_path).unwrap_or_else(|| self.pi_path.clone());
+                let executable = current_pi_path()
+                    .await?
+                    .context("Install pi or set its executable path in Settings")?;
                 let library = AgentLibrary::load(store).await?;
                 self.session_view(
                     sessions
@@ -325,6 +348,18 @@ impl Desktop {
             .await?;
         Ok(Some(readme))
     }
+}
+
+async fn settings_status(
+    action: impl FnOnce() -> Result<settings::Status> + Send + 'static,
+) -> Result<Value> {
+    Ok(serde_json::to_value(
+        tokio::task::spawn_blocking(action).await??,
+    )?)
+}
+
+async fn current_pi_path() -> Result<Option<PathBuf>> {
+    Ok(tokio::task::spawn_blocking(settings::pi_path).await?)
 }
 
 fn check_agent(agent_id: &str) -> Result<()> {
